@@ -1,0 +1,2376 @@
+#!/bin/bash
+# ==============================================================================
+# nscan — Reconocimiento activo de infraestructura
+# Author: Terry
+#
+# Documentación completa: CLAUDE.md (interno) y README.md (usuario).
+# Uso:  sudo nscan -h
+# ==============================================================================
+
+# ==========================================
+# CONFIGURACIÓN VISUAL (Dark Hacker Theme)
+# ==========================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+GRAY='\033[0;90m'
+WHITE='\033[0;37m'
+
+B_RED='\033[1;31m'
+B_GREEN='\033[1;32m'
+B_WHITE='\033[1;37m'
+B_GRAY='\033[1;30m'
+
+NC='\033[0m' # Sin color
+
+ICON_TARGET="[►]"
+ICON_SCAN="[v]"
+ICON_VULN="[☠]"
+ICON_UDP="[U]"
+ICON_TCP="[T]"
+ICON_CHECK="[+]"
+ICON_CROSS="[-]"
+ICON_WAIT="[~]"
+ICON_INFO="[*]"
+ICON_ARROW=" >"
+
+SCRIPT_NAME=$(basename "$0")
+
+# ==========================================
+# CONTROL DE SEÑALES (Ctrl+C)
+# ==========================================
+ctrl_c(){
+    printf "\n\n${B_RED}${ICON_CROSS} SECUENCIA ABORTADA POR EL USUARIO.${NC}\n"
+    tput cnorm; exit 1
+}
+trap ctrl_c INT
+
+# ==========================================
+# VERIFICACIÓN ROOT
+# ==========================================
+if [ "$(id -u)" != "0" ]; then
+    printf "${B_RED}${ICON_CROSS} ACCESO DENEGADO: Se requieren privilegios de ROOT (sudo).${NC}\n"
+    exit 1
+fi
+
+# Usuario real que invocó sudo (fallback a logname si se ejecuta como root directo)
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null)}"
+REAL_GROUP=$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")
+
+# ==========================================
+# Variables globales y timestamps
+# ==========================================
+TIMESTAMP=$(date +%Y_%m_%d_%H%M)
+SCAN_DIR=$(pwd)
+REPORT_FILE="${SCAN_DIR}/reporte_${TIMESTAMP}.html"
+DOMAIN_TREE_FILE=$(mktemp)
+
+# Estado de la herramienta (primera ejecución / actualizaciones)
+NSCAN_STATE_DIR="/var/lib/nscan"
+NSCAN_INIT_MARKER="${NSCAN_STATE_DIR}/.initialized"
+
+# Variables Iniciales
+TARGETS=""
+SPEED_MODE="normal"
+MAX_PARALLEL=1
+MIN_RATE_NMAP=1000
+DO_FULL_PIPELINE=0
+DO_UPDATE=0
+NMAP_TIMING="-T3"
+SHOW_COMMANDS=0
+
+# ==========================================
+# FUNCIÓN: BANNER (único, fijo)
+# ==========================================
+print_random_banner(){
+    printf "\n"
+    printf "${B_RED}      ███╗   ██╗ ███████╗  ██████╗  █████╗  ███╗   ██╗${NC}\n"
+    printf "${B_RED}      ████╗  ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ████╗  ██║${NC}\n"
+    printf "${B_RED}      ██╔██╗ ██║ ███████╗ ██║      ███████║ ██╔██╗ ██║${NC}\n"
+    printf "${B_RED}      ██║╚██╗██║ ╚════██║ ██║      ██╔══██║ ██║╚██╗██║${NC}\n"
+    printf "${B_RED}      ██║ ╚████║ ███████║ ╚██████╗ ██║  ██║ ██║ ╚████║${NC}\n"
+    printf "${B_RED}      ╚═╝  ╚═══╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝${NC}\n"
+    printf "\n"
+    printf "${GRAY}      ────────────────────────────────────────────────${NC}\n"
+    printf "${B_WHITE}                       Author: Terry${NC}\n"
+    printf "${GRAY}            Reconocimiento activo de infraestructura${NC}\n"
+    printf "${GRAY}      ────────────────────────────────────────────────${NC}\n"
+    printf "\n"
+}
+
+# ==========================================
+# FUNCIÓN: SEPARADOR VISUAL
+# ==========================================
+print_separator(){
+    printf "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
+
+# ==========================================
+# FUNCIÓN: print_box — cuadro de ancho fijo, ANSI-aware
+# Uso: print_box "linea con ${COLORS}" "linea 2" ...
+# Cuenta visible-width descontando secuencias ANSI para alinear el ┃ derecho.
+# ==========================================
+BOX_WIDTH=60
+print_box(){
+    local line stripped vis pad i
+    printf "${B_RED}  ┏"
+    for ((i=0; i<BOX_WIDTH; i++)); do printf "━"; done
+    printf "┓${NC}\n"
+    for line in "$@"; do
+        stripped=$(printf '%b' "$line" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
+        vis=$(printf '%s' "$stripped" | wc -m)
+        pad=$(( BOX_WIDTH - vis ))
+        [ "$pad" -lt 0 ] && pad=0
+        printf "${B_RED}  ┃${NC}%b%*s${B_RED}┃${NC}\n" "$line" "$pad" ""
+    done
+    printf "${B_RED}  ┗"
+    for ((i=0; i<BOX_WIDTH; i++)); do printf "━"; done
+    printf "┛${NC}\n"
+}
+
+# Imprime un comando bash si SHOW_COMMANDS=1 (-c). Verde sobrio.
+print_cmd(){
+    [ "${SHOW_COMMANDS:-0}" -eq 1 ] || return 0
+    printf "    ${GREEN}\$ %s${NC}\n" "$1"
+}
+
+# Cabecera de fase: ▰ FASE N — Título
+print_phase(){
+    local phase="$1"
+    local title="$2"
+    local icon="${3:-${ICON_INFO}}"
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}%s${NC} ${GRAY}—${NC} ${B_RED}%s${NC} ${GRAY}%s${NC}\n" "$phase" "$title" "$icon"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+}
+
+# ==========================================
+# Gestión de dependencias y actualizaciones
+# ==========================================
+
+_apt_install(){
+    local pkg="$1"
+    local label="$2"
+    printf "    ${GRAY}${ICON_WAIT} Instalando %s...${NC}\n" "$label"
+    local APT_OUT
+    APT_OUT=$(DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" \
+        -o Dpkg::Progress-Fancy=0 -o APT::Get::Show-Upgraded=0 2>&1)
+    local EXIT_CODE=$?
+    # Mostrar líneas relevantes del output de apt
+    printf "%s\n" "$APT_OUT" | grep -E "^(Get:|Unpacking|Setting up|Preparing|E:|W:|Err:|dpkg:)" | \
+        while IFS= read -r apt_line; do
+            if echo "$apt_line" | grep -qE "^(E:|Err:|dpkg:)"; then
+                printf "      ${B_RED}%s${NC}\n" "$apt_line"
+            elif echo "$apt_line" | grep -q "^W:"; then
+                printf "      ${B_WHITE}%s${NC}\n" "$apt_line"
+            else
+                printf "      ${GRAY}%s${NC}\n" "$apt_line"
+            fi
+        done
+    if [ "$EXIT_CODE" -eq 0 ]; then
+        printf "    ${B_GREEN}${ICON_CHECK} %s instalado.${NC}\n" "$label"
+        return 0
+    else
+        printf "    ${B_RED}${ICON_CROSS} Error instalando %s (código: %s).${NC}\n" "$label" "$EXIT_CODE"
+        printf "    ${B_RED}    Verificar conectividad y repositorios apt.${NC}\n"
+        return 1
+    fi
+}
+
+_show_searchsploit_update(){
+    printf "    ${GRAY}${ICON_WAIT} Actualizando base de datos exploitdb...${NC}\n"
+    searchsploit -u 2>&1 | grep -v "^$" | while IFS= read -r ss_line; do
+        printf "      ${GRAY}%s${NC}\n" "$ss_line"
+    done
+    printf "    ${B_GREEN}${ICON_CHECK} exploitdb actualizado.${NC}\n"
+}
+
+_show_nse_update(){
+    printf "    ${GRAY}${ICON_WAIT} Actualizando base NSE...${NC}\n"
+    nmap --script-updatedb 2>&1 | while IFS= read -r nse_line; do
+        printf "      ${GRAY}%s${NC}\n" "$nse_line"
+    done
+    local NSE_COUNT
+    NSE_COUNT=$(ls /usr/share/nmap/scripts/*.nse 2>/dev/null | wc -l)
+    printf "    ${B_GREEN}${ICON_CHECK} NSE scripts: ${GRAY}%s scripts disponibles.${NC}\n" "$NSE_COUNT"
+}
+
+_install_vulscan(){
+    local VULSCAN_NSE="/usr/share/nmap/scripts/vulscan/vulscan.nse"
+    if [ -f "$VULSCAN_NSE" ]; then
+        printf "    ${B_GREEN}${ICON_CHECK} vulscan: ${GRAY}ya instalado.${NC}\n"
+        return 0
+    fi
+    printf "    ${GRAY}${ICON_WAIT} Instalando vulscan (CVE/MITRE/SecurityFocus/OSVDB offline)...${NC}\n"
+    if ! command -v git &>/dev/null; then
+        _apt_install git git || { printf "    ${B_WHITE}${ICON_INFO} vulscan requiere git — omitiendo.${NC}\n"; return 1; }
+    fi
+    git clone --quiet https://github.com/scipag/vulscan /usr/share/nmap/scripts/vulscan 2>&1 | \
+        while IFS= read -r line; do printf "      ${GRAY}%s${NC}\n" "$line"; done
+    if [ -f "$VULSCAN_NSE" ]; then
+        printf "    ${B_GREEN}${ICON_CHECK} vulscan instalado.${NC}\n"
+    else
+        printf "    ${B_WHITE}${ICON_INFO} vulscan no disponible — continuando sin él.${NC}\n"
+    fi
+}
+
+_update_vulscan(){
+    local VULSCAN_DIR="/usr/share/nmap/scripts/vulscan"
+    if [ -d "$VULSCAN_DIR/.git" ]; then
+        printf "    ${GRAY}${ICON_WAIT} Actualizando vulscan databases...${NC}\n"
+        git -C "$VULSCAN_DIR" pull 2>&1 | while IFS= read -r line; do
+            printf "      ${GRAY}%s${NC}\n" "$line"
+        done
+        printf "    ${B_GREEN}${ICON_CHECK} vulscan actualizado.${NC}\n"
+    else
+        printf "    ${B_WHITE}${ICON_INFO} vulscan no instalado — ejecuta: %s -U para instalar.${NC}\n" "$SCRIPT_NAME"
+    fi
+}
+
+# Llamada solo en la primera ejecución — instala todo y actualiza DBs
+install_tools(){
+    printf "\n"
+    print_box \
+        "   ${B_RED}PRIMERA EJECUCIÓN${NC} ${GRAY}::${NC} ${B_WHITE}Instalando herramientas${NC}"
+    printf "    ${GRAY}Este proceso solo ocurre una vez. Próximas ejecuciones serán inmediatas.${NC}\n\n"
+
+    printf "    ${GRAY}${ICON_WAIT} Actualizando repositorios apt...${NC}\n"
+    apt-get update 2>&1 | grep -E "^(Get:|Hit:|Ign:|Err:|E:)" | while IFS= read -r line; do
+        printf "      ${GRAY}%s${NC}\n" "$line"
+    done
+    printf "    ${B_GREEN}${ICON_CHECK} Repositorios actualizados.${NC}\n\n"
+
+    # ── nmap (crítico) ───────────────────────────────────────────────
+    if ! command -v nmap &>/dev/null; then
+        if ! _apt_install nmap nmap; then
+            printf "${B_RED}[!] nmap es crítico y no pudo instalarse. Abortando.${NC}\n"
+            tput cnorm 2>/dev/null; exit 1
+        fi
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} nmap: ${GRAY}%s${NC}\n" "$(nmap --version | head -1)"
+    fi
+
+    # ── NSE scripts ──────────────────────────────────────────────────
+    if [ ! -d "/usr/share/nmap/scripts" ] || \
+       [ "$(ls /usr/share/nmap/scripts/*.nse 2>/dev/null | wc -l)" -eq 0 ]; then
+        _apt_install nmap nmap
+    fi
+    _show_nse_update
+
+    # ── host / bind-tools (DNS reversa) ─────────────────────────────
+    if ! command -v host &>/dev/null; then
+        _apt_install bind9-dnsutils host || printf "    ${B_WHITE}${ICON_INFO} DNS reversa desactivada.${NC}\n"
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} host: ${GRAY}ya instalado.${NC}\n"
+    fi
+
+    # ── traceroute ───────────────────────────────────────────────────
+    if ! command -v traceroute &>/dev/null; then
+        _apt_install traceroute traceroute || true
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} traceroute: ${GRAY}ya instalado.${NC}\n"
+    fi
+
+    # ── searchsploit / exploitdb ─────────────────────────────────────
+    if ! command -v searchsploit &>/dev/null; then
+        _apt_install exploitdb searchsploit || printf "    ${B_WHITE}${ICON_INFO} searchsploit no disponible — Fase 2b desactivada.${NC}\n"
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} searchsploit: ${GRAY}ya instalado.${NC}\n"
+    fi
+    command -v searchsploit &>/dev/null && _show_searchsploit_update
+
+    # ── jq (JSON parser para output de ExploitDB) ───────────────────
+    if ! command -v jq &>/dev/null; then
+        _apt_install jq jq || printf "    ${B_WHITE}${ICON_INFO} jq no disponible — ExploitDB usará formato texto.${NC}\n"
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} jq: ${GRAY}ya instalado.${NC}\n"
+    fi
+
+    # ── vulscan (CVE/MITRE/SecurityFocus/OSVDB, offline) ────────────
+    _install_vulscan
+
+    # ── git (necesario para vulscan) ─────────────────────────────────
+    # (instalado implícitamente en _install_vulscan si falta)
+
+    # ── Crear marker ─────────────────────────────────────────────────
+    mkdir -p "$NSCAN_STATE_DIR"
+    date +%s > "${NSCAN_STATE_DIR}/.initialized"
+    printf "\n${B_GREEN}${ICON_CHECK} Instalación completada.${NC}\n"
+    printf "    ${GRAY}Usa ${B_WHITE}%s -U${GRAY} para actualizar bases de datos cuando quieras.${NC}\n\n" "$SCRIPT_NAME"
+}
+
+# Llamada en cada ejecución normal — verifica todas las herramientas
+verify_tools(){
+    local MISSING_CRITICAL=0
+
+    # ── nmap (crítico) ───────────────────────────────────────────────
+    if ! command -v nmap &>/dev/null; then
+        printf "${B_RED}${ICON_CROSS} nmap no encontrado — intentando reinstalar...${NC}\n"
+        if ! _apt_install nmap nmap; then
+            printf "${B_RED}${ICON_CROSS} nmap no disponible. Verifica tu conexión.${NC}\n"
+            MISSING_CRITICAL=1
+        fi
+    fi
+
+    # ── NSE scripts ──────────────────────────────────────────────────
+    if [ ! -d "/usr/share/nmap/scripts" ] || \
+       [ "$(ls /usr/share/nmap/scripts/*.nse 2>/dev/null | wc -l)" -eq 0 ]; then
+        printf "${B_RED}${ICON_CROSS} Scripts NSE no encontrados — reinstalando nmap...${NC}\n"
+        _apt_install nmap nmap || MISSING_CRITICAL=1
+    fi
+
+    # ── host ─────────────────────────────────────────────────────────
+    if ! command -v host &>/dev/null; then
+        printf "${B_WHITE}${ICON_INFO} host no encontrado — reinstalando...${NC}\n"
+        _apt_install bind9-dnsutils host || \
+            printf "${B_WHITE}${ICON_INFO} DNS reversa desactivada.${NC}\n"
+    fi
+
+    # ── traceroute ───────────────────────────────────────────────────
+    if ! command -v traceroute &>/dev/null; then
+        printf "${B_WHITE}${ICON_INFO} traceroute no encontrado — reinstalando...${NC}\n"
+        _apt_install traceroute traceroute || true
+    fi
+
+    # ── searchsploit ─────────────────────────────────────────────────
+    if ! command -v searchsploit &>/dev/null; then
+        printf "${B_WHITE}${ICON_INFO} searchsploit no encontrado — reinstalando...${NC}\n"
+        _apt_install exploitdb searchsploit || \
+            printf "${B_WHITE}${ICON_INFO} Fase 2b (exploit intelligence) desactivada.${NC}\n"
+    fi
+
+    # ── jq (JSON parser para ExploitDB) ──────────────────────────────
+    if ! command -v jq &>/dev/null; then
+        printf "${B_WHITE}${ICON_INFO} jq no encontrado — reinstalando...${NC}\n"
+        _apt_install jq jq || \
+            printf "${B_WHITE}${ICON_INFO} ExploitDB usará formato texto en HTML.${NC}\n"
+    fi
+
+    # ── Verificación final de críticos ───────────────────────────────
+    if [ "$MISSING_CRITICAL" -eq 1 ]; then
+        printf "\n${B_RED}${ICON_CROSS} Herramientas críticas no disponibles.${NC}\n"
+        printf "${B_RED}    Verifica conectividad y ejecuta: %s -U${NC}\n" "$SCRIPT_NAME"
+        tput cnorm 2>/dev/null; exit 1
+    fi
+}
+
+# Llamada con -U — actualiza bases de datos y paquetes
+update_databases(){
+    printf "\n"
+    print_box \
+        "   ${B_RED}ACTUALIZANDO${NC} ${GRAY}::${NC} ${B_WHITE}Bases de datos y herramientas${NC}"
+    printf "\n"
+
+    printf "    ${GRAY}${ICON_WAIT} Actualizando repositorios apt...${NC}\n"
+    apt-get update 2>&1 | grep -E "^(Get:|Hit:|Ign:|Err:|E:|W:)" | while IFS= read -r line; do
+        printf "      ${GRAY}%s${NC}\n" "$line"
+    done
+    printf "    ${B_GREEN}${ICON_CHECK} Repositorios actualizados.${NC}\n\n"
+
+    printf "    ${GRAY}${ICON_WAIT} Actualizando nmap...${NC}\n"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nmap \
+        -o Dpkg::Progress-Fancy=0 2>&1 | \
+        grep -E "^(Get:|Unpacking|Setting up|E:|W:)" | while IFS= read -r line; do
+            printf "      ${GRAY}%s${NC}\n" "$line"
+        done
+    printf "    ${B_GREEN}${ICON_CHECK} nmap: ${GRAY}%s${NC}\n" "$(nmap --version | head -1)"
+
+    _show_nse_update
+
+    # bind9-dnsutils (host)
+    if command -v host &>/dev/null; then
+        printf "    ${GRAY}${ICON_WAIT} Actualizando bind9-dnsutils...${NC}\n"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y bind9-dnsutils \
+            -o Dpkg::Progress-Fancy=0 2>&1 | \
+            grep -E "^(Get:|Unpacking|Setting up|E:|W:)" | while IFS= read -r line; do
+                printf "      ${GRAY}%s${NC}\n" "$line"
+            done
+        printf "    ${B_GREEN}${ICON_CHECK} bind9-dnsutils actualizado.${NC}\n"
+    fi
+
+    # traceroute
+    if command -v traceroute &>/dev/null; then
+        printf "    ${GRAY}${ICON_WAIT} Actualizando traceroute...${NC}\n"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y traceroute \
+            -o Dpkg::Progress-Fancy=0 2>&1 | \
+            grep -E "^(Get:|Unpacking|Setting up|E:|W:)" | while IFS= read -r line; do
+                printf "      ${GRAY}%s${NC}\n" "$line"
+            done
+        printf "    ${B_GREEN}${ICON_CHECK} traceroute actualizado.${NC}\n"
+    fi
+
+    # jq
+    if command -v jq &>/dev/null; then
+        printf "    ${GRAY}${ICON_WAIT} Actualizando jq...${NC}\n"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y jq \
+            -o Dpkg::Progress-Fancy=0 2>&1 | \
+            grep -E "^(Get:|Unpacking|Setting up|E:|W:)" | while IFS= read -r line; do
+                printf "      ${GRAY}%s${NC}\n" "$line"
+            done
+        printf "    ${B_GREEN}${ICON_CHECK} jq actualizado.${NC}\n"
+    fi
+
+    if command -v searchsploit &>/dev/null; then
+        _show_searchsploit_update
+    else
+        printf "    ${B_WHITE}${ICON_INFO} searchsploit no instalado — omitiendo.${NC}\n"
+    fi
+
+    _update_vulscan
+
+    mkdir -p "$NSCAN_STATE_DIR"
+    date +%s > "${NSCAN_STATE_DIR}/.initialized"
+    printf "\n${B_GREEN}${ICON_CHECK} Actualización completada.${NC}\n\n"
+}
+
+# ==========================================
+# FUNCIÓN: EXTRACT PORTS (TCP)
+# ==========================================
+extractPorts(){
+    local file=$1
+    ports="$(cat "$file" | grep -oP '\d{1,5}/open' | awk '{print $1}' | cut -d '/' -f 1 | tr '\n' ',' | sed 's/,$//')"
+    ip_address="$(cat "$file" | grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | sort -u | head -n 1)"
+
+    if [ -n "$ports" ]; then
+        printf "    ${B_GREEN}┌──${ICON_CHECK} TCP PORTS EXPOSED ${NC}\n"
+        printf "    ${B_GREEN}│${NC}  ${GRAY}TARGET:${NC} %s\n" "$ip_address"
+        printf "    ${B_GREEN}└─➤${NC} ${B_GREEN}%s${NC}\n\n" "$ports"
+    else
+        printf "    ${B_RED}┌──${ICON_CROSS} NO TCP PORTS ${NC}\n"
+        printf "    ${B_RED}└─➤${NC} ${GRAY}Objetivo blindado o inalcanzable.${NC}\n\n"
+    fi
+}
+
+# ==========================================
+# FUNCIÓN: EXTRACT PORTS (UDP)
+# ==========================================
+extractPortsUDP(){
+    local file=$1
+    ports="$(cat "$file" | grep -oP '\d{1,5}/(open|open\|filtered)' | awk -F '/' '{print $1}' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')"
+    ip_address="$(cat "$file" | grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | sort -u | head -n 1)"
+
+    if [ -n "$ports" ]; then
+        printf "    ${B_GREEN}┌──${ICON_CHECK} UDP PORTS EXPOSED ${NC}\n"
+        printf "    ${B_GREEN}│${NC}  ${GRAY}TARGET:${NC} %s\n" "$ip_address"
+        printf "    ${B_GREEN}└─➤${NC} ${B_GREEN}%s${NC}\n\n" "$ports"
+    else
+        printf "    ${B_RED}┌──${ICON_CROSS} NO UDP PORTS ${NC}\n"
+        printf "    ${B_RED}└─➤${NC} ${GRAY}Ningún vector UDP interesante encontrado.${NC}\n\n"
+    fi
+}
+
+# ==========================================
+# MEJORA 5 — DNS reversa
+# ==========================================
+dns_reverse(){
+    local ip=$1
+    if command -v host &>/dev/null; then
+        local PTR
+        PTR=$(host "$ip" 2>/dev/null | grep -oP '(?<=pointer ).*' | sed 's/\.$//')
+        if [ -n "$PTR" ]; then
+            printf "    ${B_GREEN}${ICON_CHECK} DNS REVERSA:${NC} ${B_WHITE}%s${NC}\n" "$PTR" >&2
+            echo "$PTR" >> "$DOMAIN_TREE_FILE"
+            echo "$PTR"
+        fi
+    fi
+}
+
+# ==========================================
+# MEJORA 6 — Detección de firewall (multi-método con confidence scoring)
+# ==========================================
+detect_firewall(){
+    local ip=$1
+    printf "    ${GRAY}${ICON_WAIT} Detectando filtrado/firewall (probe inicial)...${NC}\r" >&2
+    local FW_RESULT
+    FW_RESULT=$(nmap -sS -p 80,443 --reason -n -Pn "$ip" 2>/dev/null | grep -E "admin-prohibited|host-prohibited|net-prohibited")
+    if [ -n "$FW_RESULT" ]; then
+        printf "    ${B_RED}${ICON_INFO} FIREWALL (probe inicial):${NC} ${GRAY}ICMP admin-prohibited (+25%%)${NC}\033[K\n" >&2
+        if [ "$SPEED_MODE" = "fast" ]; then
+            printf "    ${B_WHITE}${ICON_INFO} Recomendación:${NC} ${GRAY}considera usar -v slow para evasión${NC}\n" >&2
+        fi
+        echo "score:25;methods:admin-prohibited"
+    else
+        printf "    ${B_GREEN}${ICON_CHECK} Sin firewall ICMP detectado${NC} ${GRAY}(probe TCP 80/443 limpio)${NC}\033[K\n" >&2
+        echo "score:0;methods:none"
+    fi
+}
+
+# ─────────────────────────────────────────────
+# _fw_ack_check — Validación ACK scan (RST = unfiltered → stateful FW)
+# ─────────────────────────────────────────────
+_fw_ack_check(){
+    local ip=$1
+    printf "    ${GRAY}${ICON_WAIT} FW check: ACK scan...${NC}\r" >&2
+    local ACK_OUT
+    ACK_OUT=$(nmap -sA -p 22,80,443,445,3389,8080,53 --reason -n -Pn -T4 "$ip" 2>/dev/null)
+    local UNFILTERED_N
+    UNFILTERED_N=$(echo "$ACK_OUT" | grep -c 'unfiltered')
+    local FILTERED_N
+    FILTERED_N=$(echo "$ACK_OUT" | grep -c 'filtered')
+    # nmap reports "unfiltered" with the word filtered, exclude it from filtered count
+    FILTERED_N=$(echo "$ACK_OUT" | grep -E '\s+filtered' | grep -vc 'unfiltered')
+    printf "\033[K\r" >&2
+    if [ "$UNFILTERED_N" -ge 3 ]; then
+        printf "    ${B_RED}${ICON_INFO} ACK scan: %s unfiltered (+35%%)${NC}\n" "$UNFILTERED_N" >&2
+        echo 35
+    elif [ "$UNFILTERED_N" -ge 1 ]; then
+        printf "    ${B_RED}${ICON_INFO} ACK scan: %s unfiltered (+20%%)${NC}\n" "$UNFILTERED_N" >&2
+        echo 20
+    elif [ "$UNFILTERED_N" -eq 0 ] && [ "$FILTERED_N" -ge 1 ]; then
+        printf "    ${B_RED}${ICON_INFO} ACK scan: %s filtered (+15%%)${NC}\n" "$FILTERED_N" >&2
+        echo 15
+    else
+        echo 0
+    fi
+}
+
+# ─────────────────────────────────────────────
+# _fw_ratio_check — Ratio closed/filtered en top 100 puertos
+# ─────────────────────────────────────────────
+_fw_ratio_check(){
+    local ip=$1
+    printf "    ${GRAY}${ICON_WAIT} FW check: ratio closed/filtered...${NC}\r" >&2
+    local TMP_OUT
+    TMP_OUT=$(nmap -sS --top-ports 100 -n -Pn --reason -T4 "$ip" 2>/dev/null)
+    local CLOSED_N
+    CLOSED_N=$(echo "$TMP_OUT" | grep -c 'closed')
+    local FILTERED_N
+    FILTERED_N=$(echo "$TMP_OUT" | grep -E '\s+filtered' | grep -vc 'unfiltered')
+    printf "\033[K\r" >&2
+    if [ "$FILTERED_N" -gt 50 ] && [ "$CLOSED_N" -gt 0 ]; then
+        printf "    ${B_RED}${ICON_INFO} Ratio: filtered=%s closed=%s (+20%%)${NC}\n" "$FILTERED_N" "$CLOSED_N" >&2
+        echo 20
+    elif [ "$FILTERED_N" -gt 10 ] && [ "$CLOSED_N" -gt 0 ]; then
+        printf "    ${B_RED}${ICON_INFO} Ratio: filtered=%s closed=%s (+12%%)${NC}\n" "$FILTERED_N" "$CLOSED_N" >&2
+        echo 12
+    elif [ "$FILTERED_N" -gt 0 ] && [ "$CLOSED_N" -eq 0 ]; then
+        printf "    ${B_RED}${ICON_INFO} Ratio: filtered=%s closed=0 (+10%%)${NC}\n" "$FILTERED_N" >&2
+        echo 10
+    else
+        echo 0
+    fi
+}
+
+# ─────────────────────────────────────────────
+# _fw_bypass_check — Evidencia desde Fase 1c
+# ─────────────────────────────────────────────
+_fw_bypass_check(){
+    local bypass_results=$1
+    if echo "$bypass_results" | grep -q "opened:"; then
+        printf "    ${B_RED}${ICON_INFO} Bypass exitoso → confirma firewall (+20%%)${NC}\n" >&2
+        echo 20
+    elif echo "$bypass_results" | grep -q "all_filtered"; then
+        printf "    ${B_RED}${ICON_INFO} Bypass total fallido → firewall sólido (+5%%)${NC}\n" >&2
+        echo 5
+    else
+        echo 0
+    fi
+}
+
+# ─────────────────────────────────────────────
+# _fw_hping3_check — sonda opcional con hping3
+# ─────────────────────────────────────────────
+_fw_hping3_check(){
+    local ip=$1
+    command -v hping3 &>/dev/null || { echo 0; return; }
+    printf "    ${GRAY}${ICON_WAIT} FW check: hping3...${NC}\r" >&2
+    local HP_OUT
+    HP_OUT=$(hping3 -c 2 -S -p 445 "$ip" 2>&1; hping3 -c 2 -S -p 80 "$ip" 2>&1)
+    printf "\033[K\r" >&2
+    # Si NO se recibe RST/SA en ningún paquete (todos timeout) → señal de firewall
+    if ! echo "$HP_OUT" | grep -qE 'flags=(R|SA|RA)'; then
+        printf "    ${B_RED}${ICON_INFO} hping3: sin RST/SA (+5%%)${NC}\n" >&2
+        echo 5
+    else
+        echo 0
+    fi
+}
+
+# ─────────────────────────────────────────────
+# compute_firewall_confidence — orquestador
+# Inputs: ip, sS_file, bypass_results, initial_score
+# Output: "score:N;methods:m1+m2+..."
+# ─────────────────────────────────────────────
+compute_firewall_confidence(){
+    local ip=$1
+    local sS_file=$2
+    local bypass_results=$3
+    local initial_score=$4
+
+    local total=$initial_score
+    local methods=""
+    [ "$initial_score" -gt 0 ] && methods="admin-prohibited"
+
+    if [ "$initial_score" -gt 0 ]; then
+        printf "    ${GRAY}${ICON_INFO} Re-evaluando confianza de firewall (multi-método)...${NC}\n" >&2
+
+        local ack_score
+        ack_score=$(_fw_ack_check "$ip")
+        if [ "$ack_score" -gt 0 ]; then
+            total=$((total + ack_score))
+            if [ -n "$methods" ]; then methods="${methods}+ack-unfiltered"; else methods="ack-unfiltered"; fi
+        fi
+
+        local ratio_score
+        ratio_score=$(_fw_ratio_check "$ip")
+        if [ "$ratio_score" -gt 0 ]; then
+            total=$((total + ratio_score))
+            if [ -n "$methods" ]; then methods="${methods}+filter-ratio"; else methods="filter-ratio"; fi
+        fi
+
+        local bypass_score
+        bypass_score=$(_fw_bypass_check "$bypass_results")
+        if [ "$bypass_score" -gt 0 ]; then
+            total=$((total + bypass_score))
+            if [ -n "$methods" ]; then methods="${methods}+bypass-ok"; else methods="bypass-ok"; fi
+        fi
+
+        local hping_score
+        hping_score=$(_fw_hping3_check "$ip")
+        if [ "$hping_score" -gt 0 ]; then
+            total=$((total + hping_score))
+            if [ -n "$methods" ]; then methods="${methods}+hping3-timeout"; else methods="hping3-timeout"; fi
+        fi
+
+        printf "    ${B_RED}${ICON_INFO} Confianza firewall final: ${B_WHITE}%s%%${NC} ${GRAY}(%s)${NC}\n" "$total" "$methods" >&2
+    fi
+
+    [ "$total" -gt 100 ] && total=100
+    [ -z "$methods" ] && methods="none"
+
+    echo "score:${total};methods:${methods}"
+}
+
+# ==========================================
+# Función: detección de notación CIDR
+# ==========================================
+is_cidr(){
+    echo "$1" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$'
+}
+
+# ==========================================
+# Función: Ping + Traceroute combinado (Fase 0)
+# ==========================================
+ping_traceroute(){
+    local ip=$1
+    local TR_FILE="$ip/traceroute_${TIMESTAMP}.txt"
+    local HOST_ALIVE=0
+
+    printf "    ${GRAY}${ICON_WAIT} Verificando conectividad (ping)...${NC}\r"
+    local PING_OUT
+    PING_OUT=$(ping -c 3 -W 1 "$ip" 2>/dev/null)
+
+    if echo "$PING_OUT" | grep -q "bytes from"; then
+        HOST_ALIVE=1
+        local RTT_AVG
+        RTT_AVG=$(echo "$PING_OUT" | grep -oP 'rtt[^=]+=\s*[\d.]+/\K[\d.]+' 2>/dev/null || \
+                  echo "$PING_OUT" | grep -oP '[\d.]+/[\d.]+/[\d.]+/[\d.]+' | cut -d'/' -f2)
+        printf "    ${B_GREEN}${ICON_CHECK} HOST VIVO${NC} ${GRAY}— RTT avg: %s ms${NC}\033[K\n" "${RTT_AVG:-?}"
+    else
+        printf "    ${B_RED}${ICON_INFO} ICMP bloqueado${NC} ${GRAY}— continuando (puede responder TCP)${NC}\033[K\n"
+    fi
+
+    if command -v traceroute &>/dev/null; then
+        printf "    ${GRAY}${ICON_WAIT} Trazando ruta al target...${NC}\n"
+        local TR_OUT=""
+        if [ "$HOST_ALIVE" -eq 1 ]; then
+            TR_OUT=$(traceroute -n -m 20 -w 2 "$ip" 2>/dev/null)
+        else
+            TR_OUT=$(traceroute -T -n -m 20 -w 2 "$ip" 2>/dev/null)
+        fi
+
+        local HOP_COUNT
+        HOP_COUNT=$(echo "$TR_OUT" | grep -cE '^\s*[0-9]+' 2>/dev/null || echo 0)
+
+        if [ "$HOP_COUNT" -gt 0 ]; then
+            printf "    ${B_GREEN}${ICON_CHECK} RUTA — %s saltos:${NC}\n" "$HOP_COUNT"
+            printf "    ${GRAY}    ┌─────┬──────────────────────┬──────────┐${NC}\n"
+            printf "    ${GRAY}    │ HOP │ IP                   │ RTT      │${NC}\n"
+            printf "    ${GRAY}    ├─────┼──────────────────────┼──────────┤${NC}\n"
+            while IFS= read -r hop_line; do
+                local HOP_NUM
+                HOP_NUM=$(echo "$hop_line" | grep -oP '^\s*\K[0-9]+')
+                [ -z "$HOP_NUM" ] && continue
+                local HOP_IP
+                HOP_IP=$(echo "$hop_line" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+                [ -z "$HOP_IP" ] && HOP_IP="* * *"
+                local HOP_RTT
+                HOP_RTT=$(echo "$hop_line" | grep -oP '[\d.]+ ms' | head -1)
+                [ -z "$HOP_RTT" ] && HOP_RTT="—"
+                local MARK=""
+                [ "$HOP_IP" = "$ip" ] && MARK="${B_RED} ← TARGET${NC}"
+                printf "    ${GRAY}    │${NC} ${B_WHITE}%-3s${NC} ${GRAY}│${NC} %-20s ${GRAY}│${NC} %-8s ${GRAY}│${NC}%b\n" \
+                    "$HOP_NUM" "$HOP_IP" "$HOP_RTT" "$MARK"
+            done <<< "$TR_OUT"
+            printf "    ${GRAY}    └─────┴──────────────────────┴──────────┘${NC}\n"
+            printf "%s\n" "$TR_OUT" > "$TR_FILE" 2>/dev/null
+        fi
+    fi
+}
+
+# ==========================================
+# Función: Exploit Intelligence (Fase 2b)
+# Fuentes: ExploitDB (searchsploit --nmap) + vulscan (offline CVE/MITRE)
+# Vulners ya corre en Fase 2 vía --script vuln
+# ==========================================
+exploit_intelligence(){
+    local ip="$1"
+    local xml_file="$2"
+    local open_ports="$3"
+
+    local INTEL_FILE="${ip}/nmap/exploit_intel_${TIMESTAMP}.txt"
+    local EDB_FILE="${ip}/nmap/exploit_edb_${TIMESTAMP}.txt"
+    local EDB_JSON_FILE="${ip}/nmap/exploit_edb_${TIMESTAMP}.json"
+    local VULSCAN_FILE="${ip}/nmap/exploit_vulscan_${TIMESTAMP}.txt"
+    local SOURCES_FILE="${ip}/nmap/exploit_sources_${TIMESTAMP}.txt"
+    local EXPLOIT_SOURCES=""
+    local EDB_COUNT=0
+    local VS_HITS=0
+
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 2b${NC} ${GRAY}│${NC} ${B_RED}Exploit Intelligence${NC} ${GRAY}${ICON_VULN} fuentes agregadas${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+    printf "    ${GRAY}${ICON_ARROW} [Vulners]    ya incluido en NSE output (Fase 2)${NC}\n"
+    printf "    ${GRAY}${ICON_ARROW} [ExploitDB]  searchsploit -j --nmap (JSON + jq)${NC}\n"
+    printf "    ${GRAY}${ICON_ARROW} [vulscan]    CVE/MITRE/SecurityFocus/OSVDB offline${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    # ─── ExploitDB via searchsploit -j --nmap ───────────────────────
+    if command -v searchsploit &>/dev/null && [ -f "$xml_file" ]; then
+        printf "    ${GRAY}${ICON_WAIT} [ExploitDB] searchsploit -j --nmap...${NC}\n"
+
+        # JSON output (preferido — habilita render tabular en HTML)
+        print_cmd "searchsploit -j --nmap $xml_file > $EDB_JSON_FILE"
+        searchsploit -j --nmap "$xml_file" > "$EDB_JSON_FILE" 2>/dev/null
+
+        local JQ_OK=0
+        if command -v jq &>/dev/null && [ -s "$EDB_JSON_FILE" ]; then
+            # searchsploit emite un objeto JSON por host nmap → usar jq -s
+            EDB_COUNT=$(jq -s '[.[].RESULTS_EXPLOIT[]] | length' "$EDB_JSON_FILE" 2>/dev/null)
+            if [[ "$EDB_COUNT" =~ ^[0-9]+$ ]]; then
+                JQ_OK=1
+            else
+                EDB_COUNT=0
+            fi
+        fi
+
+        if [ "$JQ_OK" -eq 1 ]; then
+            # Archivo .txt derivado del JSON — legible y grep-friendly
+            {
+                printf "# ExploitDB — searchsploit -j --nmap\n"
+                printf "# Host: %s | Fecha: %s\n" "$ip" "$(date)"
+                printf "# Exploits encontrados: %s\n" "$EDB_COUNT"
+                printf "# Formato: [VERIFIED] CVE | EDB-ID | Type | Title\n"
+                printf "# Comando: searchsploit -m <EDB-ID>  o https://www.exploit-db.com/exploits/<EDB-ID>\n"
+                printf "# JSON crudo: exploit_edb_%s.json\n\n" "$TIMESTAMP"
+                jq -rs '
+                    [.[].RESULTS_EXPLOIT[]]
+                    | .[]
+                    | "\(if .Verified == "1" then "[V]" else "[ ]" end) \((.Codes // "") | split(";") | map(select(startswith("CVE-"))) | (first // "-")) | EDB-\(.["EDB-ID"]) | \(.Type) | \(.Title)"
+                ' "$EDB_JSON_FILE" 2>/dev/null
+            } > "$EDB_FILE"
+        else
+            # Fallback: jq no disponible o JSON malformado → texto plano legacy
+            local SS_OUT
+            print_cmd "searchsploit --nmap $xml_file"
+            SS_OUT=$(searchsploit --nmap "$xml_file" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g')
+            EDB_COUNT=$(echo "$SS_OUT" | grep -cE '/[0-9]+\.(py|pl|rb|c|sh|txt|php|java|ps1|exe)' 2>/dev/null)
+            [[ "$EDB_COUNT" =~ ^[0-9]+$ ]] || EDB_COUNT=0
+            {
+                printf "# ExploitDB — searchsploit --nmap (fallback texto, jq no disponible)\n"
+                printf "# Host: %s | Fecha: %s\n" "$ip" "$(date)"
+                printf "# Exploits encontrados: %s\n\n" "$EDB_COUNT"
+                echo "$SS_OUT"
+            } > "$EDB_FILE"
+        fi
+
+        # Referencia en archivo combinado (compacto)
+        {
+            printf "# nscan Exploit Intelligence — %s — %s\n" "$ip" "$(date)"
+            printf "# Fuentes: Vulners (NSE Fase 2), ExploitDB (searchsploit), vulscan (offline)\n\n"
+            printf "── ExploitDB (%s exploits) — ver exploit_edb_%s.txt\n" "$EDB_COUNT" "$TIMESTAMP"
+        } > "$INTEL_FILE"
+
+        if [ "$EDB_COUNT" -gt 0 ]; then
+            EXPLOIT_SOURCES="EDB"
+            printf "    ${B_RED}${ICON_VULN} [ExploitDB] %s exploit(s) encontrados${NC}\n" "$EDB_COUNT"
+            if [ "$JQ_OK" -eq 1 ]; then
+                # Vista previa terminal: top 20 desde JSON
+                jq -rs '
+                    [.[].RESULTS_EXPLOIT[]]
+                    | .[0:20][]
+                    | "  \(if .Verified == "1" then "[V]" else "[ ]" end) EDB-\(.["EDB-ID"]) | \(.Type) | \(.Title)"
+                ' "$EDB_JSON_FILE" 2>/dev/null | while IFS= read -r eline; do
+                    printf "    ${B_WHITE}%s${NC}\n" "$eline"
+                done
+            else
+                grep -E '^\[' "$EDB_FILE" | head -20 | while IFS= read -r eline; do
+                    printf "    ${B_WHITE}  %s${NC}\n" "$eline"
+                done
+            fi
+        else
+            printf "    ${B_GREEN}${ICON_CHECK} [ExploitDB] Sin coincidencias para los servicios detectados.${NC}\n"
+        fi
+    else
+        printf "    ${GRAY}${ICON_INFO} [ExploitDB] searchsploit no disponible — omitiendo.${NC}\n"
+        printf "# nscan Exploit Intelligence — %s — %s\n\n" "$ip" "$(date)" > "$INTEL_FILE"
+        printf "# ExploitDB no disponible\n" > "$EDB_FILE"
+    fi
+
+    printf "    ${GRAY}──────────────────────────────────────────────────────${NC}\n"
+
+    # ─── vulscan (offline CVE/MITRE/SecurityFocus/OSVDB) ────────────
+    local VULSCAN_NSE="/usr/share/nmap/scripts/vulscan/vulscan.nse"
+    if [ -f "$VULSCAN_NSE" ] && [ -n "$open_ports" ]; then
+        printf "    ${GRAY}${ICON_WAIT} [vulscan] offline CVE/MITRE/SecurityFocus/OSVDB...${NC}\n"
+        local VULSCAN_OUT
+        print_cmd "nmap -sV -p $open_ports --script vulscan/vulscan.nse --script-args vulscandb=cve.csv -n -Pn $NMAP_TIMING --host-timeout 10m $ip"
+        VULSCAN_OUT=$(nmap -sV -p "$open_ports" \
+            --script vulscan/vulscan.nse \
+            --script-args vulscandb=cve.csv \
+            -n -Pn $NMAP_TIMING --host-timeout 10m "$ip" 2>/dev/null)
+
+        VS_HITS=$(echo "$VULSCAN_OUT" | grep -cE '\[CVE-[0-9]' 2>/dev/null)
+        [[ "$VS_HITS" =~ ^[0-9]+$ ]] || VS_HITS=0
+
+        # Archivo dedicado vulscan — CVEs ordenados por CVSS (mayor primero)
+        {
+            printf "# vulscan — CVE/MITRE offline\n"
+            printf "# Host: %s | Fecha: %s\n" "$ip" "$(date)"
+            printf "# Total CVEs: %s\n\n" "$VS_HITS"
+            # Cabeceras de puertos
+            echo "$VULSCAN_OUT" | grep -E '^[0-9]+/(tcp|udp)\s+open'
+            printf "\n── CVEs ordenados por CVSS (mayor primero) ────────────────────\n"
+            # Extraer CVE lines + score, ordenar por score numerico desc
+            echo "$VULSCAN_OUT" | grep -E '\[CVE-[0-9]' | \
+                sed 's/.*(\([0-9.]*\)\/.*/\1\t&/' | \
+                sort -k1 -rn | cut -f2-
+            printf "\n── Fuente: nmap vulscan.nse con cve.csv (offline) ─────────────\n"
+        } > "$VULSCAN_FILE"
+
+        # Entrada en archivo combinado (solo resumen)
+        {
+            printf "── vulscan (%s CVEs) — ver exploit_vulscan_%s.txt\n" "$VS_HITS" "$TIMESTAMP"
+            # Top 20 CVEs más críticos
+            printf "── Top CVEs (CVSS alto primero):\n"
+            echo "$VULSCAN_OUT" | grep -E '\[CVE-[0-9]' | \
+                sed 's/.*(\([0-9.]*\)\/.*/\1\t&/' | \
+                sort -k1 -rn | cut -f2- | head -20
+        } >> "$INTEL_FILE"
+
+        if [ "$VS_HITS" -gt 0 ]; then
+            [ -n "$EXPLOIT_SOURCES" ] && EXPLOIT_SOURCES="${EXPLOIT_SOURCES}+vulscan" || EXPLOIT_SOURCES="vulscan"
+            printf "    ${B_RED}${ICON_VULN} [vulscan] %s CVE(s) encontrados${NC}\n" "$VS_HITS"
+            echo "$VULSCAN_OUT" | grep -E '\[CVE-[0-9]' | \
+                sed 's/.*(\([0-9.]*\)\/.*/\1\t&/' | \
+                sort -k1 -rn | cut -f2- | head -15 | while IFS= read -r vline; do
+                printf "    ${B_WHITE}  %s${NC}\n" "$vline"
+            done
+        else
+            printf "    ${B_GREEN}${ICON_CHECK} [vulscan] Sin CVEs para los servicios detectados.${NC}\n"
+            printf "# Sin CVEs detectados\n" >> "$VULSCAN_FILE"
+        fi
+    elif [ ! -f "$VULSCAN_NSE" ]; then
+        printf "    ${GRAY}${ICON_INFO} [vulscan] no instalado — ejecuta: %s -U para instalar.${NC}\n" "$SCRIPT_NAME"
+        printf "# vulscan no instalado\n" > "$VULSCAN_FILE"
+        printf "── vulscan — no instalado (ejecuta: nscan -U)\n" >> "$INTEL_FILE"
+    fi
+
+    printf "    ${GRAY}──────────────────────────────────────────────────────${NC}\n"
+
+    # Nota Vulners en archivo combinado
+    printf "── Vulners — incluido en NSE output Fase 2 (--script vuln)\n" >> "$INTEL_FILE"
+
+    # Vulners siempre está (corre vía --script vuln en Fase 2)
+    local ALL_SOURCES="Vulners"
+    [ -n "$EXPLOIT_SOURCES" ] && ALL_SOURCES="${ALL_SOURCES}+${EXPLOIT_SOURCES}"
+    EXPLOIT_SOURCES="$ALL_SOURCES"
+
+    local VULN_TOTAL=$(( EDB_COUNT + VS_HITS ))
+    printf "    ${B_WHITE}Total referencias: %s${NC} ${GRAY}| Fuentes: %s${NC}\n" "$VULN_TOTAL" "$EXPLOIT_SOURCES"
+    printf "    ${B_GREEN}${ICON_CHECK} Archivos:${NC} exploit_edb / exploit_vulscan / exploit_intel\n"
+
+    echo "$EXPLOIT_SOURCES" > "$SOURCES_FILE"
+
+    if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+        chown "$REAL_USER":"$REAL_GROUP" "$INTEL_FILE" "$EDB_FILE" "$VULSCAN_FILE" "$SOURCES_FILE" 2>/dev/null
+        [ -f "$EDB_JSON_FILE" ] && chown "$REAL_USER":"$REAL_GROUP" "$EDB_JSON_FILE" 2>/dev/null
+    fi
+}
+
+# ==========================================
+# Función: Detectar gateways de la red objetivo
+# Fuentes reales: routing table (ip route get) → nmcli → ip route default
+# Último recurso: probe SOLO de la primera IP usable (.1 convencional)
+# NO usa ARP dump (captura todos los hosts comunicados, no solo gateways)
+# NO prueba la última IP usable (cualquier host ahí sería falso positivo)
+# ==========================================
+_detect_network_gateways(){
+    local cidr="$1"
+    local -a found=()
+
+    # Primera IP usable del CIDR (posición convencional del gateway)
+    local first_usable
+    first_usable=$(python3 -c "
+import ipaddress
+n=ipaddress.ip_network('$cidr',strict=False)
+h=list(n.hosts())
+print(h[0]) if h else print('')
+" 2>/dev/null)
+
+    _gw_add(){
+        local candidate="$1"
+        [ -z "$candidate" ] && return
+        [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return
+        for f in "${found[@]}"; do [ "$f" = "$candidate" ] && return; done
+        local in_range
+        in_range=$(python3 -c "
+import ipaddress
+try: print('y' if ipaddress.ip_address('$candidate') in ipaddress.ip_network('$cidr',strict=False) else 'n')
+except: print('n')" 2>/dev/null)
+        [ "$in_range" = "y" ] && found+=("$candidate")
+    }
+
+    # ── Método 1: ip route get <first_usable> → campo "via" ─────────
+    # Si existe "via X": X es el next-hop configurado en la routing table.
+    # Solo aplica si X está dentro del CIDR (ruta directa, no inter-red).
+    if [ -n "$first_usable" ]; then
+        local route_via
+        route_via=$(ip route get "$first_usable" 2>/dev/null | grep -oP 'via \K[\d.]+' | head -1)
+        _gw_add "$route_via"
+    fi
+
+    # ── Método 2: nmcli device show — IP4.GATEWAY del iface ─────────
+    # Obtener la interfaz que usa la ruta hacia ese CIDR
+    local iface
+    iface=$(ip route get "$first_usable" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    if [ -n "$iface" ]; then
+        local nmcli_gw
+        nmcli_gw=$(nmcli device show "$iface" 2>/dev/null \
+            | grep -oP 'IP4\.GATEWAY:\s+\K[\d.]+' | head -1)
+        _gw_add "$nmcli_gw"
+
+        # ── Método 3: ip route show default dev <iface> → "via" ─────
+        local default_via
+        default_via=$(ip route show default dev "$iface" 2>/dev/null \
+            | grep -oP 'via \K[\d.]+' | head -1)
+        _gw_add "$default_via"
+    fi
+
+    # ── Método 4 (último recurso): probe de la primera IP usable ─────
+    # Solo si los métodos de routing no dieron nada.
+    # Probe SOLO del .1 (convención universal). Nunca del .254 (última usable).
+    if [ ${#found[@]} -eq 0 ] && [ -n "$first_usable" ]; then
+        local probe_result
+        probe_result=$(nmap -sn -n -PE -PS22,80,443 --max-retries 1 -T5 \
+            "$first_usable" 2>/dev/null | grep -oP 'Nmap scan report for \K[\d.]+')
+        _gw_add "$probe_result"
+    fi
+
+    printf '%s\n' "${found[@]}"
+    unset -f _gw_add
+}
+
+# ==========================================
+# Función: Network Discovery (modo CIDR)
+# ==========================================
+network_discovery(){
+    local cidr="$1"
+    local NET_LABEL
+    NET_LABEL=$(echo "$cidr" | tr '/' '-')
+    local ALIVE_FILE="${SCAN_DIR}/targets_vivos_${NET_LABEL}.txt"
+
+    local PREFIX
+    PREFIX=$(echo "$cidr" | cut -d'/' -f2)
+    local TOTAL_HOSTS=$(( (1 << (32 - PREFIX)) - 2 ))
+    [ "$TOTAL_HOSTS" -lt 1 ] && TOTAL_HOSTS=1
+
+    printf "\n"
+    print_box \
+        "$(printf "   ${ICON_SCAN} ${B_RED}MODO RED${NC}      ${GRAY}::${NC}   ${B_WHITE}%s${NC}   ${GRAY}(%s hosts)${NC}" "$cidr" "$TOTAL_HOSTS")"
+
+    # ================================================================
+    # EXCLUSIONES INTELIGENTES — antes de cualquier sweep
+    # Evita contar como activos: dirección de red, broadcast,
+    # gateway por defecto y la propia máquina que ejecuta nscan.
+    # ================================================================
+    printf " ${ICON_INFO} ${B_WHITE}Calculando exclusiones automáticas...${NC}\n"
+
+    local EXCL_LIST=()      # array de IPs a excluir
+    local EXCL_LABELS=()    # etiquetas para mostrar al usuario
+    local EXCL_GATEWAY=""   # guardamos el gateway para referencia
+
+    # ── Dirección de red y broadcast (nunca son hosts reales) ────────
+    if command -v python3 &>/dev/null; then
+        local NET_ADDR BCAST_ADDR
+        NET_ADDR=$(python3 -c \
+            "import ipaddress; n=ipaddress.ip_network('$cidr',strict=False); print(n.network_address)" \
+            2>/dev/null)
+        BCAST_ADDR=$(python3 -c \
+            "import ipaddress; n=ipaddress.ip_network('$cidr',strict=False); print(n.broadcast_address)" \
+            2>/dev/null)
+        if [ -n "$NET_ADDR" ] && [ "$NET_ADDR" != "$BCAST_ADDR" ]; then
+            EXCL_LIST+=("$NET_ADDR")
+            EXCL_LABELS+=("${NET_ADDR} [red]")
+            EXCL_LIST+=("$BCAST_ADDR")
+            EXCL_LABELS+=("${BCAST_ADDR} [broadcast]")
+        fi
+    fi
+
+    # ── Propia IP (la máquina que corre nscan) ───────────────────────
+    while IFS= read -r self_ip; do
+        [[ "$self_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        local self_in
+        self_in=$(python3 -c \
+            "import ipaddress; print('yes' if ipaddress.ip_address('$self_ip') in ipaddress.ip_network('$cidr',strict=False) else 'no')" \
+            2>/dev/null)
+        if [ "$self_in" = "yes" ]; then
+            local dup=0
+            for ex in "${EXCL_LIST[@]}"; do [ "$ex" = "$self_ip" ] && dup=1; done
+            [ "$dup" -eq 0 ] && {
+                EXCL_LIST+=("$self_ip")
+                EXCL_LABELS+=("${self_ip} [self — esta máquina]")
+            }
+        fi
+    done < <(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]')
+
+    # ── Gateways de la red objetivo ──────────────────────────────────
+    # Detección multi-método: ARP (gratis) → routing table → probe .1 y .last
+    printf "    ${GRAY}${ICON_WAIT} Detectando gateways de %s (ARP + routing + probe)...${NC}\n" "$cidr"
+    local GW_DETECTED=()
+    while IFS= read -r gw_ip; do
+        [ -z "$gw_ip" ] && continue
+        # No duplicar con exclusiones ya en lista
+        local dup=0
+        for ex in "${EXCL_LIST[@]}"; do [ "$ex" = "$gw_ip" ] && dup=1; done
+        if [ "$dup" -eq 0 ]; then
+            EXCL_LIST+=("$gw_ip")
+            EXCL_LABELS+=("${gw_ip} [gateway de red — excluido]")
+            GW_DETECTED+=("$gw_ip")
+            EXCL_GATEWAY="$gw_ip"   # para nota al final
+        fi
+    done < <(_detect_network_gateways "$cidr")
+
+    if [ ${#GW_DETECTED[@]} -gt 0 ]; then
+        printf "    ${B_WHITE}${ICON_CHECK} Gateway(s) detectados: %s${NC}\n" \
+            "$(IFS=', '; echo "${GW_DETECTED[*]}")"
+    else
+        printf "    ${GRAY}${ICON_INFO} No se detectaron gateways en el rango.${NC}\n"
+    fi
+
+    # ── Resumen de todas las exclusiones ────────────────────────────
+    printf "\n"
+    if [ ${#EXCL_LIST[@]} -gt 0 ]; then
+        printf "    ${B_WHITE}Excluidas del scan (%s IPs):${NC}\n" "${#EXCL_LIST[@]}"
+        for lbl in "${EXCL_LABELS[@]}"; do
+            printf "    ${GRAY}    ${ICON_CROSS} %s${NC}\n" "$lbl"
+        done
+    else
+        printf "    ${GRAY}${ICON_INFO} Sin exclusiones necesarias.${NC}\n"
+    fi
+    printf "\n"
+
+    # ── Construir strings de exclusión para nmap ─────────────────────
+    local EXCL_FILE=""
+    local EXCL_CSV=""
+    if [ ${#EXCL_LIST[@]} -gt 0 ]; then
+        EXCL_FILE=$(mktemp)
+        printf '%s\n' "${EXCL_LIST[@]}" > "$EXCL_FILE"
+        EXCL_CSV=$(IFS=','; echo "${EXCL_LIST[*]}")
+    fi
+
+    # ================================================================
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE N1${NC} ${GRAY}│${NC} ${B_RED}Descubriendo hosts vivos${NC} ${GRAY}${ICON_TCP} modo: ${B_WHITE}%s${NC}\n" "$SPEED_MODE"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    local TMP_SWEEP="${SCAN_DIR}/.net_sweep_${NET_LABEL}_${TIMESTAMP}.tmp"
+    local ALIVE_IPS=""
+
+    # Siempre nmap -sn con todos los métodos de probe:
+    #   -PR  (ARP Layer 2 — inbloqueable en la misma subred)
+    #   -PE  (ICMP echo)
+    #   -PS  (TCP SYN a puertos comunes — alcanza hosts con firewall ICMP)
+    #   -PA  (TCP ACK — pasa firewalls que solo filtran SYN)
+    #   -PU  (UDP — alcanza hosts sin TCP/ICMP respuesta)
+    local SN_RETRIES=1
+    [ "$SPEED_MODE" = "slow" ] && SN_RETRIES=2
+    printf "    ${GRAY}${ICON_WAIT} nmap multi-probe sweep — %s [%s]...${NC}\n" "$cidr" "$SPEED_MODE"
+    if [ -n "$EXCL_CSV" ]; then
+        print_cmd "nmap -sn -PE -PS22,80,443,445,3389,8080 -PA80,443 -PU53,161 -PR --min-rate $MIN_RATE_NMAP $NMAP_TIMING --max-retries $SN_RETRIES --exclude $EXCL_CSV $cidr -oG $TMP_SWEEP"
+        nmap -sn -PE -PS22,80,443,445,3389,8080 -PA80,443 -PU53,161 -PR \
+            --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING --max-retries "$SN_RETRIES" \
+            --exclude "$EXCL_CSV" "$cidr" -oG "$TMP_SWEEP" 2>/dev/null
+    else
+        print_cmd "nmap -sn -PE -PS22,80,443,445,3389,8080 -PA80,443 -PU53,161 -PR --min-rate $MIN_RATE_NMAP $NMAP_TIMING --max-retries $SN_RETRIES $cidr -oG $TMP_SWEEP"
+        nmap -sn -PE -PS22,80,443,445,3389,8080 -PA80,443 -PU53,161 -PR \
+            --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING --max-retries "$SN_RETRIES" \
+            "$cidr" -oG "$TMP_SWEEP" 2>/dev/null
+    fi
+    ALIVE_IPS=$(grep "Status: Up" "$TMP_SWEEP" 2>/dev/null | grep -oP 'Host: \K\d+\.\d+\.\d+\.\d+')
+
+    # Filtro post-sweep — segunda línea de defensa por si alguna
+    # IP excluida coló (algunos probes la detectan igualmente)
+    if [ ${#EXCL_LIST[@]} -gt 0 ] && [ -n "$ALIVE_IPS" ]; then
+        local FILTERED_IPS=""
+        while IFS= read -r aip; do
+            local skip=0
+            for ex in "${EXCL_LIST[@]}"; do [ "$aip" = "$ex" ] && skip=1; done
+            [ "$skip" -eq 0 ] && FILTERED_IPS="${FILTERED_IPS} ${aip}"
+        done <<< "$ALIVE_IPS"
+        ALIVE_IPS=$(echo "$FILTERED_IPS" | tr ' ' '\n' | grep -E '\.' | sort -u)
+    fi
+
+    [ -n "$EXCL_FILE" ] && rm -f "$EXCL_FILE"
+
+    local ALIVE_COUNT
+    ALIVE_COUNT=$(echo "$ALIVE_IPS" | grep -c '\.' 2>/dev/null)
+    [[ "$ALIVE_COUNT" =~ ^[0-9]+$ ]] || ALIVE_COUNT=0
+    [ -z "$ALIVE_IPS" ] && ALIVE_COUNT=0
+
+    if [ "$ALIVE_COUNT" -eq 0 ]; then
+        printf "    ${B_RED}${ICON_CROSS} Sin hosts vivos detectados en %s${NC}\n" "$cidr"
+        rm -f "$TMP_SWEEP"
+        return
+    fi
+
+    printf "    ${B_GREEN}${ICON_CHECK} %s hosts vivos detectados${NC}\n\n" "$ALIVE_COUNT"
+
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE N2${NC} ${GRAY}│${NC} ${B_RED}Quick port survey sobre hosts vivos${NC} ${GRAY}${ICON_TCP}${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    local TMP_SURVEY="${SCAN_DIR}/.net_survey_${NET_LABEL}_${TIMESTAMP}.tmp"
+    # shellcheck disable=SC2086
+    print_cmd "nmap -sS --top-ports 100 -O --osscan-guess -n -Pn --open --min-rate $MIN_RATE_NMAP $NMAP_TIMING $ALIVE_IPS -oG $TMP_SURVEY"
+    nmap -sS --top-ports 100 -O --osscan-guess -n -Pn --open \
+        --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING \
+        $ALIVE_IPS -oG "$TMP_SURVEY" 2>/dev/null
+
+    printf "\n    ${B_WHITE}%-18s %-28s %-18s %s${NC}\n" "IP" "HOSTNAME" "OS GUESS" "PUERTOS"
+    printf "    ${GRAY}%s${NC}\n" "─────────────────────────────────────────────────────────────────────────"
+
+    > "$ALIVE_FILE"
+    for alive_ip in $ALIVE_IPS; do
+        local H_NAME="—"
+        command -v host &>/dev/null && {
+            local ptr
+            ptr=$(host "$alive_ip" 2>/dev/null | grep -oP '(?<=pointer ).*' | sed 's/\.$//')
+            [ -n "$ptr" ] && H_NAME="$ptr"
+        }
+        local OS_GUESS="—"
+        local raw_os
+        raw_os=$(grep -A10 "Host: $alive_ip " "$TMP_SURVEY" 2>/dev/null | grep "OS:" | head -1 | sed 's/.*OS: //')
+        [ -n "$raw_os" ] && OS_GUESS=$(echo "$raw_os" | cut -c1-17)
+
+        local PORTS="—"
+        local raw_ports
+        raw_ports=$(grep "Host: $alive_ip " "$TMP_SURVEY" 2>/dev/null | grep -oP '\d+/open/tcp' | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//')
+        [ -n "$raw_ports" ] && PORTS="$raw_ports"
+
+        printf "    ${B_GREEN}%-18s${NC} ${GRAY}%-28s${NC} ${B_WHITE}%-18s${NC} %s\n" \
+            "$alive_ip" "$H_NAME" "$OS_GUESS" "$PORTS"
+        echo "$alive_ip" >> "$ALIVE_FILE"
+    done
+
+    rm -f "$TMP_SWEEP" "$TMP_SURVEY"
+
+    printf "\n"
+    # Mostrar nota sobre exclusiones si el gateway estaba en el rango
+    if [ -n "$EXCL_GATEWAY" ]; then
+        printf "    ${B_WHITE}${ICON_INFO} Gateway %s excluido del listado${NC} ${GRAY}(infraestructura de red, no target)${NC}\n" \
+            "$EXCL_GATEWAY"
+    fi
+    if [ ${#EXCL_LIST[@]} -gt 0 ]; then
+        printf "    ${GRAY}${ICON_INFO} %s IPs excluidas en total: red, broadcast, self, gateway${NC}\n" \
+            "${#EXCL_LIST[@]}"
+    fi
+    printf "    ${B_GREEN}${ICON_CHECK} Targets guardados:${NC} ${B_WHITE}%s${NC}\n" "$ALIVE_FILE"
+
+    if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+        chown "$REAL_USER":"$REAL_GROUP" "$ALIVE_FILE" 2>/dev/null
+    fi
+
+    if [ "$DO_FULL_PIPELINE" -eq 0 ]; then
+        printf "    ${GRAY}${ICON_INFO} Usa -R %s -v %s para el pipeline completo${NC}\n\n" \
+            "$(basename "$ALIVE_FILE")" "$SPEED_MODE"
+        return
+    fi
+
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}MODO -F${NC} ${GRAY}│${NC} ${B_RED}Pipeline completo en %s hosts${NC} ${GRAY}${ICON_SCAN}${NC}\n" "$ALIVE_COUNT"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+    printf "    ${GRAY}${ICON_INFO} Paralelo: ${B_WHITE}%s${GRAY} | Velocidad: ${B_WHITE}%s${NC}\n\n" "$MAX_PARALLEL" "$SPEED_MODE"
+
+    local ACTIVE_JOBS=0
+    for alive_ip in $ALIVE_IPS; do
+        if [ "$MAX_PARALLEL" -gt 1 ]; then
+            scan_host "$alive_ip" &
+            ACTIVE_JOBS=$(( ACTIVE_JOBS + 1 ))
+            while [ "$ACTIVE_JOBS" -ge "$MAX_PARALLEL" ]; do
+                wait -n 2>/dev/null || wait
+                ACTIVE_JOBS=$(( ACTIVE_JOBS - 1 ))
+            done
+        else
+            scan_host "$alive_ip"
+        fi
+    done
+    wait
+    tput cnorm
+    generate_html "$GLOBAL_START"
+}
+
+# ==========================================
+# show_usage_brief — banner + falta de args
+# ==========================================
+show_usage_brief(){
+    print_random_banner
+    printf "${B_RED}  ${ICON_CROSS} Faltan argumentos.${NC}\n\n"
+    printf "    ${B_WHITE}Uso rápido:${NC}\n"
+    printf "      ${GRAY}sudo${NC} ${B_WHITE}nscan${NC} ${GRAY}-r${NC} ${B_WHITE}<IP|CIDR>${NC}\n"
+    printf "      ${GRAY}sudo${NC} ${B_WHITE}nscan${NC} ${GRAY}-R${NC} ${B_WHITE}<archivo>${NC}\n\n"
+    printf "    ${B_WHITE}Documentación completa:${NC}\n"
+    printf "      ${GRAY}sudo${NC} ${B_WHITE}nscan${NC} ${GRAY}--help${NC}\n"
+    printf "      ${GRAY}sudo${NC} ${B_WHITE}nscan${NC} ${GRAY}--man${NC}\n\n"
+}
+
+# ==========================================
+# helpPanel — manual completo
+# ==========================================
+helpPanel(){
+    printf "\n"
+    print_random_banner
+
+    # --- DESCRIPCIÓN ---
+    printf "${B_RED}▰▰▰ DESCRIPCIÓN${NC}\n"
+    printf "    Reconocimiento activo de infraestructura. Pipeline progresivo\n"
+    printf "    sobre nmap que descubre puertos TCP/UDP, servicios, OS,\n"
+    printf "    versiones y CVEs conocidos, generando un reporte HTML\n"
+    printf "    consolidado al finalizar todos los targets.\n\n"
+    printf "    ${GRAY}No es una herramienta de pentesting web. Sin fuzzing de\n"
+    printf "    directorios, sin nikto, sin wpscan. Alcance: infraestructura.${NC}\n\n"
+
+    # --- OPCIONES ---
+    printf "${B_RED}▰▰▰ OPCIONES${NC}\n"
+    printf "    ${B_WHITE}-r ${GRAY}<IP|CIDR|hostname>${NC}\n"
+    printf "        Objetivo único. Acepta IPv4, CIDR o hostname resolvible.\n\n"
+
+    printf "    ${B_WHITE}-R ${GRAY}<archivo>${NC}\n"
+    printf "        Lista de objetivos. Un IP/hostname por línea.\n"
+    printf "        Líneas vacías y comentarios (#) son ignorados.\n\n"
+
+    printf "    ${B_WHITE}-v ${GRAY}slow | normal | fast${NC}\n"
+    printf "        Velocidad de escaneo (default: normal). Ver sección VELOCIDADES.\n\n"
+
+    printf "    ${B_WHITE}-p ${GRAY}<N>${NC}\n"
+    printf "        Hosts en paralelo (default: 1). Lanza N pipelines completos\n"
+    printf "        en simultáneo. El HTML se genera después del wait final.\n\n"
+
+    printf "    ${B_WHITE}-F${NC}\n"
+    printf "        Full pipeline tras CIDR discovery.\n"
+    printf "        Solo aplica cuando -r recibe un rango CIDR (ej: 192.168.1.0/24).\n"
+    printf "        Sin -F: solo descubre hosts vivos y genera el .txt.\n"
+    printf "        Con -F: descubre y luego lanza pipeline completo sobre cada uno.\n"
+    printf "        Combinable con -p N.\n\n"
+
+    printf "    ${B_WHITE}-c, --show-cmds${NC}\n"
+    printf "        Muestra en consola cada comando nmap/searchsploit ejecutado.\n"
+    printf "        Solo terminal, no HTML.\n\n"
+
+    printf "    ${B_WHITE}-U, --update${NC}\n"
+    printf "        Actualizar bases de datos y herramientas (apt + searchsploit -u +\n"
+    printf "        nmap --script-updatedb + vulscan). No requiere -r ni -R.\n\n"
+
+    printf "    ${B_WHITE}-h, --help, --man${NC}\n"
+    printf "        Mostrar esta ayuda completa.\n\n"
+
+    # --- FASES ---
+    printf "${B_RED}▰▰▰ PIPELINE — FASES${NC}\n\n"
+
+    printf "    ${B_WHITE}[Fase 0]${NC}  ${GRAY}Pre-scan Intel${NC}\n"
+    printf "        Ping ICMP (RTT promedio), traceroute (ICMP o TCP-SYN\n"
+    printf "        si ICMP bloqueado), DNS reversa (PTR) y sonda de\n"
+    printf "        firewall (SYN en 80/443 con --reason).\n\n"
+
+    printf "    ${B_WHITE}[Fase 1a]${NC} ${GRAY}TCP Discovery — nmap -sS -p-${NC}\n"
+    printf "        Escaneo SYN de los 65535 puertos. Tasa controlada por -v\n"
+    printf "        (--min-rate 100/1000/5000). Clasifica: open / filtered.\n\n"
+
+    printf "    ${B_WHITE}[Fase 1b]${NC} ${GRAY}Validación TCP Connect — nmap -sT${NC}\n"
+    printf "        Confirma sobre puertos open de Fase 1a.\n\n"
+
+    printf "    ${B_WHITE}[Fase 1c]${NC} ${GRAY}Bypass Firewall${NC} (sólo si hay filtered)\n"
+    printf "        Tres intentos progresivos:\n"
+    printf "          1. --source-port 53  → simula tráfico DNS\n"
+    printf "          2. --source-port 80  → simula tráfico HTTP\n"
+    printf "          3. -f                → fragmentación IP\n"
+    printf "        Puertos que abren entran al pipeline completo.\n\n"
+
+    printf "    ${B_WHITE}[Fase 2]${NC}  ${GRAY}Servicios + NSE Autónomo${NC}\n"
+    printf "        nmap -sV --version-intensity 9 + -O --osscan-limit.\n"
+    printf "        NSE: (vuln or safe or discovery) and not brute and not dos\n"
+    printf "             and not broadcast and not targets-asn and not dns-brute\n"
+    printf "        Incluye Vulners (CVE online sin API key).\n\n"
+
+    printf "    ${B_WHITE}[Fase 2b]${NC} ${GRAY}Exploit Intelligence — fuentes agregadas${NC}\n"
+    printf "        [Vulners]   → ya incluido en Fase 2\n"
+    printf "        [ExploitDB] → searchsploit -j --nmap <xml> (offline)\n"
+    printf "        [vulscan]   → NSE offline: CVE/MITRE/SecurityFocus/OSVDB\n\n"
+
+    printf "    ${B_WHITE}[Fase 3]${NC}  ${GRAY}UDP — dos pasadas${NC}\n"
+    printf "        Discovery: --top-ports 200 --max-retries 1\n"
+    printf "        Validación: re-scan --max-retries 3\n"
+    printf "        NSE autónomo sobre puertos UDP confirmados.\n\n"
+
+    printf "    ${B_WHITE}[Final]${NC}   ${GRAY}Reporte HTML consolidado${NC}\n"
+    printf "        Generado tras completar TODOS los targets.\n"
+    printf "        Ruta: ./reporte_<TIMESTAMP>.html\n"
+    printf "        Dark-on-light, CSS embebido, sin dependencias externas.\n\n"
+
+    # --- VELOCIDADES ---
+    printf "${B_RED}▰▰▰ VELOCIDADES (-v)${NC}\n"
+    printf "    ${B_WHITE}slow${NC}    → nmap --min-rate 100   (-T2) (+ --scan-delay 1s)\n"
+    printf "              Auditoría real, IDS/IPS activo.\n\n"
+    printf "    ${B_WHITE}normal${NC}  → nmap --min-rate 1000  (-T3)   [default]\n"
+    printf "              Balance velocidad/sigilo.\n\n"
+    printf "    ${B_WHITE}fast${NC}    → nmap --min-rate 5000  (-T4)\n"
+    printf "              CTF, laboratorios sin monitoreo.\n\n"
+
+    # --- ARCHIVOS GENERADOS ---
+    printf "${B_RED}▰▰▰ ARCHIVOS GENERADOS${NC}\n"
+    printf "    ${GRAY}<IP>/traceroute_<TS>.txt${NC}                 Ruta al target\n"
+    printf "    ${GRAY}<IP>/nmap/discovery_<TS>_sS${NC}              SYN scan completo\n"
+    printf "    ${GRAY}<IP>/nmap/discovery_<TS>_sT${NC}              Validación TCP Connect\n"
+    printf "    ${GRAY}<IP>/nmap/discovery_<TS>_bypass53${NC}        Bypass source-port 53\n"
+    printf "    ${GRAY}<IP>/nmap/discovery_<TS>_bypass80${NC}        Bypass source-port 80\n"
+    printf "    ${GRAY}<IP>/nmap/discovery_<TS>_bypassf${NC}         Bypass fragmentación\n"
+    printf "    ${GRAY}<IP>/nmap/targeted_<TS>.txt${NC}              Servicios + NSE TCP\n"
+    printf "    ${GRAY}<IP>/nmap/targeted_<TS>.xml${NC}              XML para searchsploit\n"
+    printf "    ${GRAY}<IP>/nmap/exploit_intel_<TS>.txt${NC}         Exploit Intelligence\n"
+    printf "    ${GRAY}<IP>/nmap/exploit_sources_<TS>.txt${NC}       Fuentes CVE activas\n"
+    printf "    ${GRAY}<IP>/nmap/sU_discovery_<TS>${NC}              Discovery UDP\n"
+    printf "    ${GRAY}<IP>/nmap/sU_discovery_validated_<TS>${NC}    Validación UDP\n"
+    printf "    ${GRAY}<IP>/nmap/sU_targeted_<TS>.txt${NC}           Servicios + NSE UDP\n"
+    printf "    ${B_WHITE}./reporte_<TS>.html${NC}                      Reporte HTML final\n"
+    printf "    ${B_WHITE}./targets_vivos_<NET>.txt${NC}                Hosts vivos (modo CIDR)\n\n"
+
+    # --- DEPENDENCIAS ---
+    printf "${B_RED}▰▰▰ DEPENDENCIAS${NC}\n"
+    printf "    ${B_WHITE}nmap${NC}          Obligatorio.  apt install nmap\n"
+    printf "    ${B_WHITE}host${NC}          Opcional.     apt install bind9-dnsutils\n"
+    printf "    ${B_WHITE}traceroute${NC}    Opcional.     apt install traceroute\n"
+    printf "    ${B_WHITE}searchsploit${NC}  Opcional.     apt install exploitdb\n"
+    printf "    ${B_WHITE}jq${NC}            Opcional.     apt install jq (JSON de EDB)\n"
+    printf "    ${B_WHITE}vulscan${NC}       Opcional.     auto-clonado en primera ejecución\n"
+    printf "    ${GRAY}  Las herramientas opcionales se instalan en la primera ejecución.${NC}\n"
+    printf "    ${GRAY}  Si faltan en ejecuciones posteriores, se reinstalan automáticamente.${NC}\n\n"
+
+    # --- EJEMPLOS ---
+    printf "${B_RED}▰▰▰ EJEMPLOS${NC}\n"
+    printf "    ${GRAY}# Escaneo básico, modo normal${NC}\n"
+    printf "    ${ICON_ARROW} %s -r 10.10.10.10\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# CTF — máxima velocidad${NC}\n"
+    printf "    ${ICON_ARROW} %s -r 10.10.10.10 -v fast\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# Cliente real — sigilo máximo${NC}\n"
+    printf "    ${ICON_ARROW} %s -r 192.168.1.1 -v slow\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# Múltiples targets en paralelo${NC}\n"
+    printf "    ${ICON_ARROW} %s -R targets.txt -v normal -p 3\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# Descubrir hosts vivos en red /24 (solo discovery)${NC}\n"
+    printf "    ${ICON_ARROW} %s -r 192.168.1.0/24\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# Descubrir /24 y luego pipeline completo en paralelo${NC}\n"
+    printf "    ${ICON_ARROW} %s -r 10.10.10.0/24 -v fast -F -p 3\n\n" "$SCRIPT_NAME"
+
+    printf "    ${GRAY}# Usar lista generada por CIDR discovery${NC}\n"
+    printf "    ${ICON_ARROW} %s -R targets_vivos_192.168.1.0-24.txt -v normal -p 2\n\n" "$SCRIPT_NAME"
+}
+
+# ==========================================
+# MEJORA 4 — getopts actualizado
+# ==========================================
+
+# Soporte para --help, --man, --update (long options antes de getopts)
+for _arg in "$@"; do
+    case "$_arg" in
+        --help|--man) helpPanel; exit 0 ;;
+        --update)     DO_UPDATE=1 ;;
+        --show-cmds)  SHOW_COMMANDS=1 ;;
+    esac
+done
+unset _arg
+
+if [ $# -eq 0 ]; then show_usage_brief; exit 1; fi
+
+while getopts "r:R:v:p:FUhc" opt; do
+  case $opt in
+    h) helpPanel; exit 0 ;;
+    r) TARGETS="$OPTARG" ;;
+    R)
+       if [ -f "$OPTARG" ]; then
+           TARGETS=$(cat "$OPTARG")
+       else
+           printf "${B_RED}[!] Archivo '%s' no existe.${NC}\n" "$OPTARG"; exit 1
+       fi ;;
+    v)
+       case "$OPTARG" in
+           slow)   SPEED_MODE="slow";   MIN_RATE_NMAP=100;   NMAP_TIMING="-T2" ;;
+           normal) SPEED_MODE="normal"; MIN_RATE_NMAP=1000;  NMAP_TIMING="-T3" ;;
+           fast)   SPEED_MODE="fast";   MIN_RATE_NMAP=5000;  NMAP_TIMING="-T4" ;;
+           *) printf "${B_RED}[!] Velocidad inválida. Usar: slow, normal, fast${NC}\n"; exit 1 ;;
+       esac ;;
+    p)
+       if echo "$OPTARG" | grep -qE '^[1-9][0-9]*$'; then
+           MAX_PARALLEL="$OPTARG"
+       else
+           printf "${B_RED}[!] -p debe ser un número entero positivo.${NC}\n"; exit 1
+       fi ;;
+    F) DO_FULL_PIPELINE=1 ;;
+    U) DO_UPDATE=1 ;;
+    c) SHOW_COMMANDS=1 ;;
+    *) helpPanel; exit 1 ;;
+  esac
+done
+
+# -U no requiere target
+if [ "$DO_UPDATE" -eq 0 ] && [ -z "$TARGETS" ]; then
+    printf "${B_RED}[!] Error: objetivo no definido. Usar -r <IP/CIDR> o -R <archivo>.${NC}\n"; exit 1
+fi
+
+# ==========================================
+# MEJORA 7 — Función scan_host
+# ==========================================
+scan_host(){
+    local ip=$1
+    local IP_START_TS
+    IP_START_TS=$(date +%s)
+    local IP_HOSTNAME=""
+    local FW_STATUS="unknown"
+    local TCP_OPEN_PORTS=""
+    local TCP_FILTERED_PORTS=""
+    local UDP_OPEN_PORTS=""
+    local BYPASS_RESULTS=""
+    # Timeout por host para Fase 2/3 NSE — evita colgarse en scripts lentos (DNS, etc.)
+    local HOST_TIMEOUT="--host-timeout 15m"
+    [ "$SPEED_MODE" = "slow" ] && HOST_TIMEOUT="--host-timeout 30m"
+    [ "$SPEED_MODE" = "fast" ] && HOST_TIMEOUT="--host-timeout 5m"
+
+    printf "\n"
+    print_box \
+        "$(printf "   ${ICON_TARGET} ${B_RED}TARGET LOCKED${NC}   ${GRAY}::${NC}   ${B_WHITE}%s${NC}" "$ip")"
+
+    install -d -m 755 -o "${REAL_USER:-root}" -g "${REAL_GROUP:-root}" "$ip/nmap"
+
+    # ================================================================
+    # FASE 0 — PRE-SCAN: Ping+Traceroute + DNS reversa + Firewall
+    # ================================================================
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 0${NC} ${GRAY}│${NC} ${B_RED}Pre-scan Intel${NC} ${GRAY}${ICON_INFO}${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    ping_traceroute "$ip"
+    IP_HOSTNAME=$(dns_reverse "$ip")
+    local FW_INITIAL
+    FW_INITIAL=$(detect_firewall "$ip")
+    local FW_INITIAL_SCORE
+    FW_INITIAL_SCORE=$(echo "$FW_INITIAL" | grep -oP 'score:\K[0-9]+')
+    [ -z "$FW_INITIAL_SCORE" ] && FW_INITIAL_SCORE=0
+    # FW_STATUS provisional — se recalcula al final con toda la evidencia
+    FW_STATUS="$FW_INITIAL"
+
+    # ================================================================
+    # FASE 1a — DISCOVERY TCP (nmap -sS -p-)
+    # ================================================================
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 1a${NC} ${GRAY}│${NC} ${B_RED}TCP Discovery${NC} ${GRAY}${ICON_TCP} modo: ${B_WHITE}%s${NC}\n" "$SPEED_MODE"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    local DISCOVERY_FILE="$ip/nmap/discovery_${TIMESTAMP}"
+
+    # nmap -sS -p- : escaneo SYN completo sobre los 65535 puertos.
+    # nmap es más confiable en redes locales/VM (sin pérdida de paquetes).
+    printf "    ${GRAY}${ICON_WAIT} nmap -sS -p- (rate: %s, %s)...${NC}\n" "$MIN_RATE_NMAP" "$NMAP_TIMING"
+    local EXTRA_DELAY=""
+    [ "$SPEED_MODE" = "slow" ] && EXTRA_DELAY="--scan-delay 1s"
+    print_cmd "nmap -sS -p- -n -Pn --reason --open --min-rate $MIN_RATE_NMAP $NMAP_TIMING $EXTRA_DELAY --stats-every 3s $ip -oG ${DISCOVERY_FILE}_sS"
+    nmap -sS -p- -n -Pn --reason --open --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING $EXTRA_DELAY \
+        --stats-every 3s "$ip" -oG "${DISCOVERY_FILE}_sS" 2>&1 | \
+    grep --line-buffered "Timing" | \
+    while read -r line; do
+        local pct
+        pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+        printf "    ${GRAY}${ICON_WAIT} SYN scanning... ${B_GREEN}%s${NC}\033[K\r" "$pct"
+    done
+    printf "\033[K\r"
+    TCP_OPEN_PORTS=$(grep -oP '\d+/open' "${DISCOVERY_FILE}_sS" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+    TCP_FILTERED_PORTS=$(grep -oP '\d+/filtered' "${DISCOVERY_FILE}_sS" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+
+    # Fase 1b — Validación final con nmap -sT sobre puertos open
+    if [ -n "$TCP_OPEN_PORTS" ]; then
+        printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 1b${NC} ${GRAY}│${NC} ${B_RED}Validación TCP Connect${NC} ${GRAY}${ICON_TCP}${NC}\n"
+        printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+        print_cmd "nmap -sT -p $TCP_OPEN_PORTS -n -Pn --reason --min-rate $MIN_RATE_NMAP $NMAP_TIMING --stats-every 3s $ip -oG ${DISCOVERY_FILE}_sT"
+        nmap -sT -p "$TCP_OPEN_PORTS" -n -Pn --reason --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING \
+            --stats-every 3s "$ip" -oG "${DISCOVERY_FILE}_sT" 2>&1 | \
+        grep --line-buffered "Timing" | \
+        while read -r line; do
+            local pct
+            pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+            printf "    ${GRAY}${ICON_WAIT} Connect validating... ${B_GREEN}%s${NC}\033[K\r" "$pct"
+        done
+        printf "\033[K\r"
+        TCP_OPEN_PORTS=$(grep -oP '\d+/open' "${DISCOVERY_FILE}_sT" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+    fi
+
+    extractPorts "${DISCOVERY_FILE}_sT" 2>/dev/null || extractPorts "${DISCOVERY_FILE}_sS" 2>/dev/null
+
+    # ================================================================
+    # FASE 1c — BYPASS para puertos FILTERED
+    # ================================================================
+    if [ -n "$TCP_FILTERED_PORTS" ]; then
+        printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 1c${NC} ${GRAY}│${NC} ${B_RED}Bypass firewall — puertos filtrados${NC} ${GRAY}${ICON_TCP}${NC}\n"
+        printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+        printf "    ${GRAY}${ICON_INFO} Puertos filtered detectados: ${B_WHITE}%s${NC}\n" "$TCP_FILTERED_PORTS"
+
+        local BYPASS_OPENED=""
+
+        # Intento 1: --source-port 53
+        printf "    ${GRAY}${ICON_WAIT} Intento 1: --source-port 53 (DNS bypass)...${NC}\r"
+        print_cmd "nmap -sS -p $TCP_FILTERED_PORTS -n -Pn --source-port 53 --reason --min-rate $MIN_RATE_NMAP $NMAP_TIMING $ip -oG ${DISCOVERY_FILE}_bypass53"
+        nmap -sS -p "$TCP_FILTERED_PORTS" -n -Pn --source-port 53 --reason \
+            --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING "$ip" -oG "${DISCOVERY_FILE}_bypass53" 2>/dev/null
+        BYPASS_OPENED=$(grep -oP '\d+/open' "${DISCOVERY_FILE}_bypass53" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+        printf "\033[K\r"
+
+        # Intento 2: --source-port 80 sobre los que siguen filtered
+        if [ -z "$BYPASS_OPENED" ]; then
+            printf "    ${GRAY}${ICON_WAIT} Intento 2: --source-port 80 (HTTP bypass)...${NC}\r"
+            print_cmd "nmap -sT -p $TCP_FILTERED_PORTS -n -Pn --source-port 80 --reason --min-rate $MIN_RATE_NMAP $NMAP_TIMING $ip -oG ${DISCOVERY_FILE}_bypass80"
+            nmap -sT -p "$TCP_FILTERED_PORTS" -n -Pn --source-port 80 --reason \
+                --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING "$ip" -oG "${DISCOVERY_FILE}_bypass80" 2>/dev/null
+            BYPASS_OPENED=$(grep -oP '\d+/open' "${DISCOVERY_FILE}_bypass80" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            printf "\033[K\r"
+        fi
+
+        # Intento 3: -f fragmentación
+        if [ -z "$BYPASS_OPENED" ]; then
+            printf "    ${GRAY}${ICON_WAIT} Intento 3: -f fragmentación de paquetes...${NC}\r"
+            print_cmd "nmap -sS -f -p $TCP_FILTERED_PORTS -n -Pn --reason --min-rate $MIN_RATE_NMAP $NMAP_TIMING $ip -oG ${DISCOVERY_FILE}_bypassf"
+            nmap -sS -f -p "$TCP_FILTERED_PORTS" -n -Pn --reason \
+                --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING "$ip" -oG "${DISCOVERY_FILE}_bypassf" 2>/dev/null
+            BYPASS_OPENED=$(grep -oP '\d+/open' "${DISCOVERY_FILE}_bypassf" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            printf "\033[K\r"
+        fi
+
+        if [ -n "$BYPASS_OPENED" ]; then
+            printf "    ${B_GREEN}${ICON_CHECK} BYPASS EXITOSO — puertos abiertos: %s${NC}\n" "$BYPASS_OPENED"
+            if [ -n "$TCP_OPEN_PORTS" ]; then
+                TCP_OPEN_PORTS="${TCP_OPEN_PORTS},${BYPASS_OPENED}"
+            else
+                TCP_OPEN_PORTS="$BYPASS_OPENED"
+            fi
+            BYPASS_RESULTS="opened:$BYPASS_OPENED"
+        else
+            printf "    ${B_RED}${ICON_CROSS} Todos los intentos fallaron — puertos bloqueados por firewall${NC}\n"
+            BYPASS_RESULTS="all_filtered:$TCP_FILTERED_PORTS"
+        fi
+    fi
+
+    # ================================================================
+    # FASE 2 — SERVICIOS + NSE AUTÓNOMO
+    # ================================================================
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 2${NC} ${GRAY}│${NC} ${B_RED}Servicios + NSE Autónomo${NC} ${GRAY}${ICON_VULN}${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    local TARGETED_FILE="$ip/nmap/targeted_${TIMESTAMP}.txt"
+    local TARGETED_XML="$ip/nmap/targeted_${TIMESTAMP}.xml"
+
+    if [ -n "$TCP_OPEN_PORTS" ]; then
+        printf "    ${GRAY}${ICON_ARROW} Puertos a analizar: %s${NC}\n" "$TCP_OPEN_PORTS"
+        printf "    ${GRAY}${ICON_ARROW} nmap seleccionará automáticamente los scripts NSE por servicio...${NC}\n"
+
+        print_cmd "nmap -sT -sV -O --osscan-limit --version-intensity 9 --script='(vuln or safe or discovery) and not brute and not dos and not broadcast and not targets-asn and not dns-brute' -p $TCP_OPEN_PORTS -n -Pn --reason --min-rate $MIN_RATE_NMAP $NMAP_TIMING $HOST_TIMEOUT $ip -oN $TARGETED_FILE -oX $TARGETED_XML"
+        nmap -sT -sV -O --osscan-limit --version-intensity 9 \
+            --script="(vuln or safe or discovery) and not brute and not dos and not broadcast and not targets-asn and not dns-brute" \
+            -p "$TCP_OPEN_PORTS" -n -Pn --reason \
+            --min-rate "$MIN_RATE_NMAP" $NMAP_TIMING \
+            $HOST_TIMEOUT --stats-every 3s "$ip" \
+            -oN "$TARGETED_FILE" -oX "$TARGETED_XML" 2>&1 | \
+        grep --line-buffered "Timing" | \
+        while read -r line; do
+            local pct
+            pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+            printf "    ${B_RED}${ICON_WAIT} Analyzing services... ${B_WHITE}%s${NC}\033[K\r" "$pct"
+        done
+        printf "\033[K\r"
+        printf "    ${B_GREEN}${ICON_CHECK} DATA HARVESTED:${NC} %s\n" "$TARGETED_FILE"
+
+        exploit_intelligence "$ip" "$TARGETED_XML" "$TCP_OPEN_PORTS"
+    else
+        printf "    ${GRAY}${ICON_INFO} Sin puertos TCP confirmados para análisis profundo.${NC}\n"
+    fi
+
+    # ================================================================
+    # FASE 3 — UDP EN DOS FASES
+    # ================================================================
+    printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 3${NC} ${GRAY}│${NC} ${B_RED}UDP Discovery + Validación${NC} ${GRAY}${ICON_UDP}${NC}\n"
+    printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+
+    local UDP_DISCOVERY_FILE="$ip/nmap/sU_discovery_${TIMESTAMP}"
+    local UDP_TARGETED_FILE="$ip/nmap/sU_targeted_${TIMESTAMP}.txt"
+
+    printf "    ${GRAY}${ICON_WAIT} Discovery UDP top 200 (rápido)...${NC}\n"
+    print_cmd "nmap -sU --top-ports 200 --max-retries 1 --reason -n -Pn $NMAP_TIMING --stats-every 3s $ip -oG $UDP_DISCOVERY_FILE"
+    nmap -sU --top-ports 200 --max-retries 1 --reason -n -Pn \
+        $NMAP_TIMING --stats-every 3s "$ip" -oG "$UDP_DISCOVERY_FILE" 2>&1 | \
+    grep --line-buffered "Timing" | \
+    while read -r line; do
+        local pct
+        pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+        printf "    ${GRAY}${ICON_WAIT} UDP probing... ${B_GREEN}%s${NC}\033[K\r" "$pct"
+    done
+    printf "\033[K\r"
+
+    local UDP_CANDIDATES
+    UDP_CANDIDATES=$(grep -oP '\d+/(open|open\|filtered)' "$UDP_DISCOVERY_FILE" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+
+    if [ -n "$UDP_CANDIDATES" ]; then
+        printf "    ${GRAY}${ICON_WAIT} Validando candidatos UDP: %s${NC}\n" "$UDP_CANDIDATES"
+        local UDP_VALIDATION_FILE="${UDP_DISCOVERY_FILE}_validated"
+        print_cmd "nmap -sU -p $UDP_CANDIDATES --max-retries 3 --reason -n -Pn $NMAP_TIMING --stats-every 3s $ip -oG $UDP_VALIDATION_FILE"
+        nmap -sU -p "$UDP_CANDIDATES" --max-retries 3 --reason -n -Pn \
+            $NMAP_TIMING --stats-every 3s "$ip" -oG "$UDP_VALIDATION_FILE" 2>&1 | \
+        grep --line-buffered "Timing" | \
+        while read -r line; do
+            local pct
+            pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+            printf "    ${GRAY}${ICON_WAIT} Validating UDP... ${B_GREEN}%s${NC}\033[K\r" "$pct"
+        done
+        printf "\033[K\r"
+        UDP_OPEN_PORTS=$(grep -oP '\d+/open' "$UDP_VALIDATION_FILE" 2>/dev/null | cut -d'/' -f1 | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+    fi
+
+    extractPortsUDP "$UDP_DISCOVERY_FILE"
+
+    if [ -n "$UDP_OPEN_PORTS" ]; then
+        printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FASE 3b${NC} ${GRAY}│${NC} ${B_RED}UDP NSE Autónomo${NC} ${GRAY}${ICON_VULN}${NC}\n"
+        printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+        printf "    ${GRAY}${ICON_ARROW} Puertos UDP confirmados: ${B_WHITE}%s${NC}\n" "$UDP_OPEN_PORTS"
+
+        print_cmd "nmap -sU -sV --script='(vuln or safe or discovery) and not brute and not dos and not broadcast and not targets-asn and not dns-brute' -p $UDP_OPEN_PORTS --reason -n -Pn $NMAP_TIMING $HOST_TIMEOUT $ip -oN $UDP_TARGETED_FILE"
+        nmap -sU -sV \
+            --script="(vuln or safe or discovery) and not brute and not dos and not broadcast and not targets-asn and not dns-brute" \
+            -p "$UDP_OPEN_PORTS" --reason -n -Pn \
+            $NMAP_TIMING $HOST_TIMEOUT --stats-every 3s "$ip" \
+            -oN "$UDP_TARGETED_FILE" 2>&1 | \
+        grep --line-buffered "Timing" | \
+        while read -r line; do
+            local pct
+            pct=$(echo "$line" | grep -oP '\d+\.\d+%')
+            printf "    ${B_RED}${ICON_WAIT} UDP NSE... ${B_WHITE}%s${NC}\033[K\r" "$pct"
+        done
+        printf "\033[K\r"
+        printf "    ${B_GREEN}${ICON_CHECK} DATA HARVESTED:${NC} %s\n" "$UDP_TARGETED_FILE"
+    fi
+
+    # ================================================================
+    # FIN DE HOST — Timestamps y permisos
+    # ================================================================
+    local IP_END_TS
+    IP_END_TS=$(date +%s)
+    local IP_DURATION=$(( IP_END_TS - IP_START_TS ))
+    local IP_DURATION_FMT
+    IP_DURATION_FMT=$(printf '%dm %ds' $((IP_DURATION/60)) $((IP_DURATION%60)))
+
+    printf "\n    ${B_GREEN}${ICON_CHECK} Host completado en %s${NC}\n" "$IP_DURATION_FMT"
+
+    # Re-evaluar confianza de firewall con toda la evidencia recolectada
+    # (solo si la probe inicial sugirió firewall — lazy exit)
+    if [ "$FW_INITIAL_SCORE" -gt 0 ]; then
+        printf "\n${B_RED}  ▰▰▰${NC} ${B_WHITE}FIREWALL${NC} ${GRAY}│${NC} ${B_RED}Confidence multi-method scoring${NC} ${GRAY}${ICON_INFO}${NC}\n"
+        printf "${GRAY}  ────────────────────────────────────────────────────────────${NC}\n"
+    fi
+    FW_STATUS=$(compute_firewall_confidence "$ip" "${DISCOVERY_FILE}_sS" "$BYPASS_RESULTS" "$FW_INITIAL_SCORE")
+
+    # Leer fuentes de exploit intelligence
+    local EXPLOIT_SOURCES_VAL=""
+    local SOURCES_F="${ip}/nmap/exploit_sources_${TIMESTAMP}.txt"
+    [ -f "$SOURCES_F" ] && EXPLOIT_SOURCES_VAL=$(cat "$SOURCES_F" 2>/dev/null)
+
+    # Guardar datos del host para el HTML (formato: IP|HOSTNAME|FW|TCP_PORTS|UDP_PORTS|START|END|DURATION|BYPASS|FILTERED|EXPLOIT_SOURCES)
+    echo "${ip}|${IP_HOSTNAME}|${FW_STATUS}|${TCP_OPEN_PORTS}|${UDP_OPEN_PORTS}|${IP_START_TS}|${IP_END_TS}|${IP_DURATION_FMT}|${BYPASS_RESULTS}|${TCP_FILTERED_PORTS}|${EXPLOIT_SOURCES_VAL}" \
+        >> "${SCAN_DIR}/.scan_results_${TIMESTAMP}.tmp"
+
+    if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+        chown -R "$REAL_USER":"$REAL_GROUP" "$ip"
+    fi
+}
+
+# ==========================================
+# MEJORA 8 — Generación del HTML
+# ==========================================
+generate_html(){
+    local RESULTS_TMP="${SCAN_DIR}/.scan_results_${TIMESTAMP}.tmp"
+    local GLOBAL_START="$1"
+    local GLOBAL_END
+    GLOBAL_END=$(date +%s)
+    local GLOBAL_DURATION=$(( GLOBAL_END - GLOBAL_START ))
+    local GLOBAL_FMT
+    GLOBAL_FMT=$(printf '%dh %dm %ds' $((GLOBAL_DURATION/3600)) $(( (GLOBAL_DURATION%3600)/60 )) $((GLOBAL_DURATION%60)))
+
+    local DOMAIN_TREE_HTML=""
+    if [ -s "$DOMAIN_TREE_FILE" ]; then
+        DOMAIN_TREE_HTML="<ul>"
+        while IFS= read -r hostname; do
+            local IS_DC=""
+            echo "$hostname" | grep -qiE 'dc[0-9]|domaincontroller' && IS_DC=" <span class='badge badge-dc'>DC</span>"
+            DOMAIN_TREE_HTML="${DOMAIN_TREE_HTML}<li>${hostname}${IS_DC}</li>"
+        done < "$DOMAIN_TREE_FILE"
+        DOMAIN_TREE_HTML="${DOMAIN_TREE_HTML}</ul>"
+    else
+        DOMAIN_TREE_HTML="<p class='domain-empty'>No se detectaron hostnames durante el scan.</p>"
+    fi
+
+    local SUMMARY_ROWS=""
+    local HOST_SECTIONS=""
+
+    if [ -f "$RESULTS_TMP" ]; then
+        while IFS='|' read -r h_ip h_host h_fw h_tcp h_udp h_start h_end h_dur h_bypass h_filtered h_exploits; do
+            local H_START_FMT
+            H_START_FMT=$(date -d "@${h_start}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "${h_start}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+            local H_END_FMT
+            H_END_FMT=$(date -d "@${h_end}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "${h_end}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+
+            # Parse score y métodos desde h_fw (formato: "score:N;methods:m1+m2+...")
+            local FW_SCORE
+            FW_SCORE=$(echo "$h_fw" | grep -oP 'score:\K[0-9]+')
+            [ -z "$FW_SCORE" ] && FW_SCORE=0
+            local FW_METHODS
+            FW_METHODS=$(echo "$h_fw" | grep -oP 'methods:\K[^;]+')
+            [ -z "$FW_METHODS" ] && FW_METHODS="none"
+
+            local FW_BADGE=""
+            local CARD_CLASS="clean"
+            if [ "$FW_SCORE" -ge 60 ]; then
+                FW_BADGE="<span class='badge badge-fw'>&#128293; FIREWALL ${FW_SCORE}%</span>"
+                CARD_CLASS="has-fw"
+            elif [ "$FW_SCORE" -ge 30 ]; then
+                FW_BADGE="<span class='badge badge-warn'>&#9888; POSIBLE FW ${FW_SCORE}%</span>"
+                CARD_CLASS="has-fw"
+            else
+                FW_BADGE="<span class='badge badge-expose'>&#9888; SIN FIREWALL</span>"
+            fi
+
+            # Construir badges de métodos activados
+            local FW_METHODS_HTML=""
+            if [ "$FW_METHODS" != "none" ]; then
+                local METHOD_ARR
+                IFS='+' read -ra METHOD_ARR <<< "$FW_METHODS"
+                local m
+                for m in "${METHOD_ARR[@]}"; do
+                    case "$m" in
+                        admin-prohibited) FW_METHODS_HTML="${FW_METHODS_HTML}<span class='method-badge'>ICMP admin-prohibited (25%)</span>" ;;
+                        ack-unfiltered)   FW_METHODS_HTML="${FW_METHODS_HTML}<span class='method-badge'>ACK scan unfiltered (35%)</span>" ;;
+                        filter-ratio)     FW_METHODS_HTML="${FW_METHODS_HTML}<span class='method-badge'>Ratio closed/filtered (20%)</span>" ;;
+                        bypass-ok)        FW_METHODS_HTML="${FW_METHODS_HTML}<span class='method-badge'>Bypass exitoso (20%)</span>" ;;
+                        hping3-timeout)   FW_METHODS_HTML="${FW_METHODS_HTML}<span class='method-badge'>hping3 timeout (+5%)</span>" ;;
+                    esac
+                done
+            fi
+
+            local FW_EVIDENCE_HTML=""
+            if [ "$FW_SCORE" -gt 0 ]; then
+                FW_EVIDENCE_HTML="<div class='fw-evidence'><div class='block-title'>&#128737; Métodos de detección activados</div><div class='fw-methods'>${FW_METHODS_HTML}</div><div class='fw-confidence-bar'><div class='fw-bar' style='width: ${FW_SCORE}%'></div><span class='fw-bar-label'>${FW_SCORE}% certeza</span></div></div>"
+            fi
+
+            local DC_BADGE=""
+            echo "$h_host" | grep -qiE 'dc[0-9]|domaincontroller' && DC_BADGE=" <span class='badge badge-dc'>DC</span>"
+
+            local EXPLOIT_BADGE=""
+            if [ -n "$h_exploits" ]; then
+                EXPLOIT_BADGE="<span class='badge badge-exploit'>${h_exploits}</span>"
+                CARD_CLASS="has-exploit"
+            fi
+
+            local TCP_DISPLAY="${h_tcp:-<span class='badge-none'>—</span>}"
+            local UDP_DISPLAY="${h_udp:-<span class='badge-none'>—</span>}"
+
+            SUMMARY_ROWS="${SUMMARY_ROWS}
+            <tr onclick=\"document.getElementById('host-${h_ip}').scrollIntoView({behavior:'smooth'}); setTimeout(function(){ var b=document.getElementById('body-${h_ip}'); if(!b.classList.contains('visible')) toggleHost('${h_ip}'); }, 300);\">
+                <td><code>${h_ip}</code></td>
+                <td>${h_host:-<span class='badge-none'>—</span>}${DC_BADGE}</td>
+                <td class='port-list'>${TCP_DISPLAY}</td>
+                <td class='port-list'>${UDP_DISPLAY}</td>
+                <td>${FW_BADGE}</td>
+                <td>${EXPLOIT_BADGE:-<span class='badge-none'>—</span>}</td>
+                <td>${h_dur}</td>
+            </tr>"
+
+            local NSE_CONTENT=""
+            local TARGETED_F="${h_ip}/nmap/targeted_${TIMESTAMP}.txt"
+            if [ -f "$TARGETED_F" ]; then
+                NSE_CONTENT=$(sed 's/</\&lt;/g; s/>/\&gt;/g' "$TARGETED_F")
+            fi
+
+            local UDP_NSE_CONTENT=""
+            local UDP_TARGETED_F="${h_ip}/nmap/sU_targeted_${TIMESTAMP}.txt"
+            if [ -f "$UDP_TARGETED_F" ]; then
+                UDP_NSE_CONTENT=$(sed 's/</\&lt;/g; s/>/\&gt;/g' "$UDP_TARGETED_F")
+            fi
+
+            local TRACEROUTE_HTML=""
+            local TR_F="${h_ip}/traceroute_${TIMESTAMP}.txt"
+            if [ -f "$TR_F" ]; then
+                TRACEROUTE_HTML="<div class='traceroute-wrap'><div class='block-title'>&#9654; Ruta al target</div><table class='tr-table'>"
+                local hop_n=0
+                while IFS= read -r tr_line; do
+                    local hn
+                    hn=$(echo "$tr_line" | grep -oP '^\s*\K[0-9]+')
+                    [ -z "$hn" ] && continue
+                    local hi
+                    hi=$(echo "$tr_line" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+                    [ -z "$hi" ] && hi="* * *"
+                    local hr
+                    hr=$(echo "$tr_line" | grep -oP '[\d.]+ ms' | head -1)
+                    [ -z "$hr" ] && hr="—"
+                    local tgt_class=""
+                    [ "$hi" = "$h_ip" ] && tgt_class=" target"
+                    TRACEROUTE_HTML="${TRACEROUTE_HTML}<tr><td class='tr-num'>${hn}</td><td class='tr-ip${tgt_class}'>${hi}</td><td class='tr-rtt'>${hr}</td></tr>"
+                    hop_n=$(( hop_n + 1 ))
+                done < "$TR_F"
+                TRACEROUTE_HTML="${TRACEROUTE_HTML}</table></div>"
+            fi
+
+            # ── EXPLOIT INTELLIGENCE — caja por fuente ──────────────
+            local EDB_BOX_HTML=""
+            local EDB_F="${h_ip}/nmap/exploit_edb_${TIMESTAMP}.txt"
+            local EDB_JSON_F="${h_ip}/nmap/exploit_edb_${TIMESTAMP}.json"
+            local EDB_N=0
+            local EDB_TABLE_ROWS=""
+
+            # Preferimos el JSON (tabular). Si no hay jq o JSON inválido → fallback <pre>.
+            if [ -f "$EDB_JSON_F" ] && [ -s "$EDB_JSON_F" ] && command -v jq &>/dev/null; then
+                EDB_N=$(jq -s '[.[].RESULTS_EXPLOIT[]] | length' "$EDB_JSON_F" 2>/dev/null)
+                [[ "$EDB_N" =~ ^[0-9]+$ ]] || EDB_N=0
+
+                if [ "$EDB_N" -gt 0 ]; then
+                    while IFS=$'\t' read -r v_flag cve eid title etype platform source; do
+                        [ -z "$eid" ] && continue
+                        # CVE cell
+                        local cve_cell
+                        if [[ "$cve" =~ ^CVE- ]]; then
+                            cve_cell="<a href='https://nvd.nist.gov/vuln/detail/${cve}' target='_blank' rel='noopener'>${cve}</a>"
+                        else
+                            cve_cell="<span class='edb-none'>&mdash;</span>"
+                        fi
+                        # Verified cell
+                        local v_cell
+                        if [ "$v_flag" = "1" ]; then
+                            v_cell="<span class='edb-verified' title='Verified'>&#10003;</span>"
+                        else
+                            v_cell="<span class='edb-unverified' title='Not verified'>&mdash;</span>"
+                        fi
+                        # Type badge
+                        local type_class="edb-type-other"
+                        case "$etype" in
+                            remote)    type_class="edb-type-remote" ;;
+                            local)     type_class="edb-type-local" ;;
+                            webapps)   type_class="edb-type-webapps" ;;
+                            dos)       type_class="edb-type-dos" ;;
+                            shellcode) type_class="edb-type-shellcode" ;;
+                        esac
+                        # HTML-escape title + platform
+                        local title_esc platform_esc
+                        title_esc=$(printf '%s' "$title" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        platform_esc=$(printf '%s' "$platform" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                        local etype_esc
+                        etype_esc=$(printf '%s' "$etype" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                        local eid_esc
+                        eid_esc=$(printf '%s' "$eid" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                        # Title con tooltip de fuente original (securityfocus, metasploit, etc.) si existe
+                        local title_html="${title_esc}"
+                        if [ -n "$source" ] && [[ "$source" =~ ^https?:// ]]; then
+                            local source_esc
+                            source_esc=$(printf '%s' "$source" | sed 's/&/\&amp;/g; s/"/\&quot;/g')
+                            title_html="<a href='${source_esc}' target='_blank' rel='noopener' title='Fuente original: ${source_esc}' class='edb-title-link'>${title_esc}</a>"
+                        fi
+
+                        EDB_TABLE_ROWS="${EDB_TABLE_ROWS}<tr><td class='edb-v'>${v_cell}</td><td class='edb-cve'>${cve_cell}</td><td class='edb-id'><a href='https://www.exploit-db.com/exploits/${eid_esc}' target='_blank' rel='noopener'>${eid_esc}</a></td><td class='edb-title'>${title_html}</td><td><span class='edb-type-badge ${type_class}'>${etype_esc}</span></td><td class='edb-platform'>${platform_esc}</td><td class='edb-action'><code>searchsploit -m ${eid_esc}</code></td></tr>"
+                    done < <(jq -rs '
+                        [.[].RESULTS_EXPLOIT[]]
+                        | sort_by(
+                            (if .Verified == "1" then 0 else 1 end),
+                            (if .Type == "remote" then 0
+                             elif .Type == "local" then 1
+                             elif .Type == "webapps" then 2
+                             elif .Type == "dos" then 3
+                             elif .Type == "shellcode" then 4
+                             else 5 end),
+                            (try (-(.["EDB-ID"] | tonumber)) catch 0)
+                          )
+                        | .[]
+                        | [
+                            (.Verified // ""),
+                            ((.Codes // "") | split(";") | map(select(startswith("CVE-"))) | (first // "")),
+                            (.["EDB-ID"] // ""),
+                            (.Title // ""),
+                            (.Type // ""),
+                            (.Platform // ""),
+                            (.Source // "")
+                          ]
+                        | @tsv
+                    ' "$EDB_JSON_F" 2>/dev/null)
+                fi
+
+                if [ -n "$EDB_TABLE_ROWS" ]; then
+                    EDB_BOX_HTML="<div class='source-box edb-box'><div class='block-title'>&#128296; ExploitDB <span class='src-count'>${EDB_N} exploits</span><span class='src-hint'>Click EDB-ID o CVE para detalle &middot; copia el comando de la columna Acci&oacute;n</span></div><div class='edb-table-wrap'><table class='edb-table'><thead><tr><th>&#10003;</th><th>CVE</th><th>EDB-ID</th><th>T&iacute;tulo</th><th>Tipo</th><th>Plataforma</th><th>Acci&oacute;n</th></tr></thead><tbody>${EDB_TABLE_ROWS}</tbody></table></div></div>"
+                fi
+            fi
+
+            # Fallback: si no se pudo construir tabla pero hay .txt con resultados, usar <pre>
+            if [ -z "$EDB_BOX_HTML" ] && [ -f "$EDB_F" ] && grep -qE '/[0-9]+\.(py|pl|rb|c|sh|txt|php|java|ps1|exe)|^\[' "$EDB_F" 2>/dev/null; then
+                local EDB_C
+                EDB_C=$(sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$EDB_F")
+                local EDB_N_TXT
+                EDB_N_TXT=$(grep -cE '/[0-9]+\.(py|pl|rb|c|sh|txt|php|java|ps1|exe)|^\[' "$EDB_F" 2>/dev/null)
+                [[ "$EDB_N_TXT" =~ ^[0-9]+$ ]] || EDB_N_TXT=0
+                EDB_BOX_HTML="<div class='pre-wrap source-box edb-box'><div class='block-title'>&#128296; ExploitDB <span class='src-count'>${EDB_N_TXT} exploits</span><span class='src-hint'>jq no disponible &mdash; formato texto</span></div><div class='pre-body'><pre>${EDB_C}</pre></div></div>"
+            fi
+
+            local VS_BOX_HTML=""
+            local VS_F="${h_ip}/nmap/exploit_vulscan_${TIMESTAMP}.txt"
+            if [ -f "$VS_F" ] && grep -qE '\[CVE-[0-9]' "$VS_F" 2>/dev/null; then
+                local VS_C
+                VS_C=$(grep -E '^#|^──|^\|| \[CVE-' "$VS_F" | head -120 | sed 's/</\&lt;/g; s/>/\&gt;/g')
+                local VS_N
+                VS_N=$(grep -c '\[CVE-' "$VS_F" 2>/dev/null || echo "")
+                VS_BOX_HTML="<div class='pre-wrap source-box vulscan-box'><div class='block-title'>&#128218; vulscan — CVE/MITRE offline <span class='src-count'>${VS_N} CVEs</span><span class='src-hint'>Ordenados por CVSS descendente</span></div><div class='pre-body'><pre>${VS_C}</pre></div></div>"
+            fi
+
+            local VULNERS_NOTE_HTML=""
+            if echo "${NSE_CONTENT}" | grep -qi "vulners"; then
+                VULNERS_NOTE_HTML="<div class='vulners-note'>&#9432; Resultados de <strong>Vulners</strong> integrados en NSE TCP (ver abajo)</div>"
+            fi
+
+            local EXPLOIT_HTML=""
+            if [ -n "$EDB_BOX_HTML" ] || [ -n "$VS_BOX_HTML" ]; then
+                EXPLOIT_HTML="<div class='exploit-section'>${EDB_BOX_HTML}${VS_BOX_HTML}${VULNERS_NOTE_HTML}</div>"
+            fi
+
+            local BYPASS_HTML=""
+            if [ -n "$h_bypass" ]; then
+                BYPASS_HTML="<div class='bypass-wrap'><div class='block-title'>&#9888; Bypass Firewall</div><p class='bypass-text'>${h_bypass}</p>"
+                [ -n "$h_filtered" ] && BYPASS_HTML="${BYPASS_HTML}<p class='bypass-text' style='margin-top:6px;color:#92400e;'>Puertos que permanecen filtrados: ${h_filtered}</p>"
+                BYPASS_HTML="${BYPASS_HTML}</div>"
+            fi
+
+            local TCP_PORTS_PREVIEW=""
+            [ -n "$h_tcp" ] && TCP_PORTS_PREVIEW="<span class='host-ports-preview'>${h_tcp}</span>"
+
+            # Compute port boxes — avoid bash :+ :- double-expansion bug
+            local TCP_BOX UDP_BOX
+            [ -n "$h_tcp" ] && TCP_BOX="<span class='ports-val'>${h_tcp}</span>" || TCP_BOX="<span class='ports-none'>Ninguno detectado</span>"
+            [ -n "$h_udp" ] && UDP_BOX="<span class='ports-val'>${h_udp}</span>" || UDP_BOX="<span class='ports-none'>Ninguno detectado</span>"
+
+            HOST_SECTIONS="${HOST_SECTIONS}
+            <div class='host-card ${CARD_CLASS}' id='host-${h_ip}'>
+                <div class='host-header' onclick='toggleHost(\"${h_ip}\")'>
+                    <span class='host-pill'>${h_ip}</span>
+                    <span class='host-name'>${h_host:-sin hostname}${DC_BADGE}</span>
+                    ${TCP_PORTS_PREVIEW}
+                    ${FW_BADGE}
+                    <span class='host-dur'>${h_dur}</span>
+                    <span class='chevron' id='icon-${h_ip}'>&#8964;</span>
+                </div>
+                <div class='host-body' id='body-${h_ip}'>
+                    <div class='body-inner'>
+                        <div class='meta-strip'>
+                            <div class='meta-item'><span class='meta-label'>Inicio</span><span class='meta-val'>${H_START_FMT}</span></div>
+                            <div class='meta-item'><span class='meta-label'>Fin</span><span class='meta-val'>${H_END_FMT}</span></div>
+                            <div class='meta-item'><span class='meta-label'>Duracion</span><span class='meta-val'>${h_dur}</span></div>
+                            <div class='meta-item'><span class='meta-label'>Firewall</span><span class='meta-val'>${FW_BADGE}</span></div>
+                        </div>
+                        ${TRACEROUTE_HTML}
+                        <div class='ports-row'>
+                            <div class='ports-box tcp'>
+                                <div class='ports-box-label'>&#9656; TCP Puertos</div>
+                                ${TCP_BOX}
+                            </div>
+                            <div class='ports-box udp'>
+                                <div class='ports-box-label'>&#9656; UDP Puertos</div>
+                                ${UDP_BOX}
+                            </div>
+                        </div>
+                        ${FW_EVIDENCE_HTML}
+                        ${BYPASS_HTML}
+                        ${EXPLOIT_HTML}
+                        <div class='pre-wrap'>
+                            <div class='block-title'>&#128196; NSE TCP</div>
+                            <div class='pre-body'><pre>${NSE_CONTENT:-Sin resultados NSE TCP}</pre></div>
+                        </div>
+                        <div class='pre-wrap'>
+                            <div class='block-title'>&#128196; NSE UDP</div>
+                            <div class='pre-body'><pre>${UDP_NSE_CONTENT:-Sin resultados NSE UDP}</pre></div>
+                        </div>
+                    </div>
+                </div>
+            </div>"
+        done < "$RESULTS_TMP"
+    fi
+
+    cat > "$REPORT_FILE" <<HTMLEOF
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nscan — Reporte ${TIMESTAMP}</title>
+<style>
+  :root {
+    --page:    #f0f4f8;
+    --card:    #ffffff;
+    --navy:    #0f3460;
+    --teal:    #0e7490;
+    --teal-lt: #e0f2fe;
+    --text:    #1e293b;
+    --muted:   #64748b;
+    --border:  #e2e8f0;
+    --row-alt: #f8fafc;
+    --green:   #059669;
+    --green-lt:#d1fae5;
+    --orange:  #d97706;
+    --orange-lt:#fef3c7;
+    --red:     #dc2626;
+    --red-lt:  #fee2e2;
+    --blue:    #2563eb;
+    --blue-lt: #dbeafe;
+    --mono:    'SF Mono','Cascadia Code',Consolas,'Courier New',monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--page); color: var(--text); font-family: system-ui,-apple-system,'Segoe UI',sans-serif; font-size: 14px; line-height: 1.6; }
+
+  /* ── HEADER ── */
+  .header {
+    background: var(--navy);
+    color: #fff;
+    padding: 28px 40px 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 16px;
+  }
+  .header-left { display: flex; align-items: center; gap: 14px; }
+  .header-logo {
+    width: 40px; height: 40px; border-radius: 8px;
+    background: var(--teal); display: flex; align-items: center; justify-content: center;
+    font-size: 20px; flex-shrink: 0;
+  }
+  .header h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; color: #fff; }
+  .header h1 span { color: #7dd3fc; }
+  .header-meta { display: flex; gap: 20px; flex-wrap: wrap; }
+  .header-meta .chip {
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 20px; padding: 4px 12px; font-size: 12px; color: #bae6fd;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .chip-icon { opacity: 0.7; }
+
+  /* ── LAYOUT ── */
+  .main { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  .section { margin-bottom: 36px; }
+  .section-header {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 16px; padding-bottom: 10px;
+    border-bottom: 2px solid var(--border);
+  }
+  .section-icon { font-size: 16px; }
+  .section-header h2 { font-size: 15px; font-weight: 600; color: var(--navy); letter-spacing: -0.2px; }
+  .section-count { margin-left: auto; font-size: 12px; color: var(--muted); background: var(--row-alt); border: 1px solid var(--border); padding: 2px 8px; border-radius: 10px; }
+
+  /* ── SUMMARY TABLE ── */
+  .table-wrap { background: var(--card); border-radius: 10px; border: 1px solid var(--border); overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { background: var(--navy); color: rgba(255,255,255,0.85); font-size: 11px; font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase; padding: 11px 14px; text-align: left; }
+  tbody tr { border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.12s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:nth-child(even) { background: var(--row-alt); }
+  tbody tr:hover { background: var(--teal-lt); }
+  td { padding: 10px 14px; vertical-align: middle; font-size: 13px; }
+  td code { font-family: var(--mono); font-size: 12px; color: var(--navy); font-weight: 600; background: var(--teal-lt); padding: 2px 6px; border-radius: 4px; }
+  .port-list { font-family: var(--mono); font-size: 11px; color: var(--muted); line-height: 1.8; }
+
+  /* ── BADGES ── */
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.3px; }
+  .badge-ok    { background: var(--green-lt); color: var(--green); }
+  .badge-fw    { background: var(--red-lt); color: var(--red); }
+  .badge-warn  { background: #fef3c7; color: #b45309; }
+  .badge-expose { background: var(--red-lt); color: var(--red); border: 1px dashed var(--red); }
+  .badge-dc    { background: var(--blue-lt); color: var(--blue); }
+  .badge-exploit { background: var(--red-lt); color: var(--red); font-family: var(--mono); font-size: 10px; }
+  .badge-none  { color: var(--muted); font-size: 12px; }
+
+  /* ── FIREWALL EVIDENCE BOX ── */
+  .fw-evidence { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; padding: 14px; }
+  .fw-evidence .block-title { background: none; border: none; padding: 0 0 8px; color: #92400e; }
+  .fw-methods { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .method-badge { background: #fff; border: 1px solid #fde68a; color: #92400e; padding: 3px 10px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .fw-confidence-bar { background: #fff; border-radius: 10px; height: 18px; position: relative; overflow: hidden; margin-top: 8px; border: 1px solid #fde68a; }
+  .fw-bar { height: 100%; background: linear-gradient(to right, #fbbf24, #dc2626); border-radius: 10px; transition: width 0.3s; }
+  .fw-bar-label { position: absolute; top: 0; left: 50%; transform: translateX(-50%); font-size: 11px; font-weight: 700; color: var(--text); line-height: 18px; }
+
+  /* ── DOMAIN LIST ── */
+  .domain-list { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  .domain-list ul { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; }
+  .domain-list li { background: var(--teal-lt); color: var(--teal); border: 1px solid #bae6fd; border-radius: 6px; padding: 4px 12px; font-size: 13px; font-family: var(--mono); }
+  .domain-empty { color: var(--muted); font-size: 13px; }
+
+  /* ── HOST CARDS ── */
+  .host-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); overflow: hidden; transition: box-shadow 0.2s; }
+  .host-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+  .host-card.has-fw { border-left: 4px solid var(--orange); }
+  .host-card.has-exploit { border-left: 4px solid var(--red); }
+  .host-card.clean { border-left: 4px solid var(--green); }
+
+  .host-header { display: flex; align-items: center; gap: 14px; padding: 14px 20px; cursor: pointer; user-select: none; }
+  .host-header:hover { background: var(--row-alt); }
+  .host-pill { background: var(--navy); color: #fff; font-family: var(--mono); font-size: 13px; font-weight: 700; padding: 4px 12px; border-radius: 6px; letter-spacing: 0.3px; }
+  .host-name { color: var(--muted); font-size: 13px; flex: 1; }
+  .host-ports-preview { font-family: var(--mono); font-size: 11px; color: var(--teal); background: var(--teal-lt); padding: 2px 8px; border-radius: 4px; }
+  .host-dur { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .chevron { color: var(--muted); font-size: 13px; transition: transform 0.25s; margin-left: 8px; }
+  .chevron.open { transform: rotate(180deg); }
+
+  .host-body { display: none; border-top: 1px solid var(--border); }
+  .host-body.visible { display: block; }
+
+  /* ── HOST BODY INTERNALS ── */
+  .body-inner { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  .meta-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; background: var(--row-alt); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .meta-item { font-size: 12px; }
+  .meta-label { color: var(--muted); display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 2px; }
+  .meta-val { color: var(--text); font-weight: 500; }
+
+  .ports-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .ports-box { border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .ports-box-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .ports-box.tcp .ports-box-label { color: var(--green); }
+  .ports-box.udp .ports-box-label { color: var(--orange); }
+  .ports-val { font-family: var(--mono); font-size: 12px; color: var(--text); word-break: break-all; }
+  .ports-none { color: var(--muted); font-size: 12px; }
+
+  .traceroute-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .block-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 10px 14px; background: var(--row-alt); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; }
+  .tr-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+  .tr-table td { padding: 7px 14px; border-bottom: 1px solid var(--border); }
+  .tr-table tr:last-child td { border-bottom: none; }
+  .tr-num { color: var(--muted); width: 36px; }
+  .tr-ip { color: var(--teal); }
+  .tr-ip.target { color: var(--navy); font-weight: 700; }
+  .tr-rtt { color: var(--muted); text-align: right; }
+
+  .pre-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .pre-body { padding: 14px; background: #f8fafc; max-height: 400px; overflow-y: auto; overflow-x: auto; }
+  .pre-body pre { font-family: var(--mono); font-size: 11.5px; color: var(--text); white-space: pre; line-height: 1.55; }
+
+  .exploit-wrap .block-title { color: var(--red); }
+  .exploit-wrap .pre-body { background: #fff8f8; }
+
+  .exploit-section { display: flex; flex-direction: column; gap: 12px; }
+  .source-box .block-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .src-count { margin-left: 6px; background: rgba(0,0,0,0.07); border-radius: 10px; padding: 1px 8px; font-size: 10px; font-weight: 700; letter-spacing: 0.3px; }
+  .src-hint { margin-left: auto; font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); font-family: var(--mono); }
+  .edb-box .block-title { color: var(--red); }
+  .edb-box .pre-body { background: #fff8f8; }
+  .edb-table-wrap { background: #fff8f8; max-height: 500px; overflow: auto; border: 1px solid #fee2e2; border-radius: 6px; }
+  .edb-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .edb-table thead th { background: #fee2e2; color: #991b1b; text-align: left; padding: 8px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; position: sticky; top: 0; z-index: 1; }
+  .edb-table tbody td { padding: 7px 10px; border-bottom: 1px solid #fee2e2; vertical-align: middle; }
+  .edb-table tbody tr:last-child td { border-bottom: none; }
+  .edb-table tbody tr:hover { background: #fef2f2; }
+  .edb-v { text-align: center; width: 32px; }
+  .edb-verified { color: var(--green); font-weight: 700; font-size: 14px; }
+  .edb-unverified, .edb-none { color: var(--muted); }
+  .edb-cve a, .edb-id a { color: var(--red); text-decoration: none; font-family: var(--mono); font-weight: 600; }
+  .edb-cve a:hover, .edb-id a:hover { text-decoration: underline; }
+  .edb-title { color: var(--text); max-width: 380px; }
+  .edb-title-link { color: var(--text); text-decoration: none; border-bottom: 1px dotted var(--muted); }
+  .edb-title-link:hover { color: var(--navy); border-bottom-color: var(--navy); }
+  .edb-platform { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .edb-action code { font-family: var(--mono); font-size: 11px; background: #f8fafc; padding: 2px 6px; border-radius: 3px; border: 1px solid var(--border); color: var(--navy); cursor: text; user-select: all; }
+  .edb-type-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .edb-type-remote   { background: #fee2e2; color: #991b1b; }
+  .edb-type-local    { background: #fef3c7; color: #92400e; }
+  .edb-type-webapps  { background: #dbeafe; color: #1e40af; }
+  .edb-type-dos      { background: #e5e7eb; color: #374151; }
+  .edb-type-shellcode{ background: #ede9fe; color: #5b21b6; }
+  .edb-type-other    { background: #f3f4f6; color: #4b5563; }
+  .vulscan-box .block-title { color: #7c3aed; }
+  .vulscan-box .pre-body { background: #faf5ff; }
+  .vulners-note { background: var(--teal-lt); border: 1px solid #bae6fd; border-radius: 8px; padding: 10px 14px; font-size: 12px; color: var(--teal); display: flex; align-items: center; gap: 8px; }
+
+  .bypass-wrap { background: var(--orange-lt); border: 1px solid #fde68a; border-radius: 8px; padding: 14px 16px; }
+  .bypass-wrap .block-title { background: none; border: none; padding: 0 0 8px; color: var(--orange); }
+  .bypass-text { font-size: 13px; color: var(--text); }
+
+  /* ── FOOTER ── */
+  .footer { margin-top: 32px; padding: 28px 24px 32px; background: var(--card); border-top: 1px solid var(--border); text-align: center; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .footer-brand { font-size: 13px; color: var(--text); letter-spacing: 0.2px; }
+  .footer-brand strong { color: var(--navy); font-weight: 600; letter-spacing: 0.3px; }
+  .footer-divider { width: 48px; height: 2px; background: linear-gradient(90deg, transparent, var(--teal), transparent); border-radius: 2px; margin: 2px 0 4px; opacity: 0.7; }
+  .footer-meta { font-size: 11.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 10px; font-variant-numeric: tabular-nums; }
+  .footer-meta strong { color: var(--navy); font-weight: 600; }
+  .footer-meta .sep { color: var(--border); font-weight: 400; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="header-logo">&#128269;</div>
+    <div>
+      <h1><span>n</span>scan &mdash; Reporte de Reconocimiento</h1>
+    </div>
+  </div>
+  <div class="header-meta">
+    <div class="chip"><span class="chip-icon">&#128197;</span> ${TIMESTAMP}</div>
+    <div class="chip"><span class="chip-icon">&#9200;</span> ${GLOBAL_FMT}</div>
+    <div class="chip"><span class="chip-icon">&#9889;</span> ${SPEED_MODE}</div>
+    <div class="chip"><span class="chip-icon">&#9881;</span> paralelo: ${MAX_PARALLEL}</div>
+  </div>
+</div>
+
+<div class="main">
+
+  <div class="section">
+    <div class="section-header">
+      <span class="section-icon">&#9776;</span>
+      <h2>Resumen de Targets</h2>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>IP</th><th>Hostname</th><th>TCP Puertos</th><th>UDP Puertos</th><th>Firewall</th><th>Exploits</th><th>Duracion</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${SUMMARY_ROWS}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <span class="section-icon">&#127760;</span>
+      <h2>Correlacion de Dominios</h2>
+    </div>
+    <div class="domain-list">
+      ${DOMAIN_TREE_HTML}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <span class="section-icon">&#9881;</span>
+      <h2>Detalle por Host</h2>
+    </div>
+    ${HOST_SECTIONS}
+  </div>
+
+</div>
+
+<div class="footer">
+  <div class="footer-brand">Generado por <strong>nscan</strong></div>
+  <div class="footer-divider"></div>
+  <div class="footer-meta">Author: <strong>Terry</strong> <span class="sep">&middot;</span> ${TIMESTAMP}</div>
+</div>
+
+<script>
+function toggleHost(ip) {
+  var body = document.getElementById('body-' + ip);
+  var icon = document.getElementById('icon-' + ip);
+  if (body.classList.contains('visible')) {
+    body.classList.remove('visible');
+    icon.classList.remove('open');
+  } else {
+    body.classList.add('visible');
+    icon.classList.add('open');
+  }
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var first = document.querySelector('.host-header');
+  if (first) first.click();
+});
+</script>
+</body>
+</html>
+HTMLEOF
+
+    rm -f "$RESULTS_TMP" "$DOMAIN_TREE_FILE"
+
+    printf "\n${B_GREEN}${ICON_CHECK} REPORTE HTML GENERADO:${NC} ${B_WHITE}%s${NC}\n" "$REPORT_FILE"
+
+    if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+        chown "$REAL_USER":"$REAL_GROUP" "$REPORT_FILE"
+    fi
+}
+
+# ==========================================
+# Lógica principal
+# ==========================================
+tput civis
+
+# Primera ejecución: instalar todo. Ejecuciones siguientes: solo verificar.
+if [ ! -f "$NSCAN_INIT_MARKER" ]; then
+    install_tools
+else
+    verify_tools
+fi
+
+# -U: actualizar bases de datos y salir
+if [ "$DO_UPDATE" -eq 1 ]; then
+    printf "\n"
+    print_random_banner
+    update_databases
+    tput cnorm
+    exit 0
+fi
+
+GLOBAL_START=$(date +%s)
+
+printf "\n"
+print_random_banner
+print_box \
+    "  ${ICON_SCAN} ${B_WHITE}INICIANDO RECONOCIMIENTO${NC}" \
+    "$(printf "     ${GRAY}Velocidad:${NC} ${B_WHITE}%s${NC}   ${GRAY}Paralelo:${NC} ${B_WHITE}%s${NC}" "$SPEED_MODE" "$MAX_PARALLEL")"
+
+ACTIVE_JOBS=0
+
+# Detectar si el target es CIDR (solo aplica con -r, target único)
+TARGET_WORD_COUNT=$(echo "$TARGETS" | wc -w)
+if [ "$TARGET_WORD_COUNT" -eq 1 ] && is_cidr "$TARGETS"; then
+    network_discovery "$TARGETS"
+    # Si -F, network_discovery ya llamó generate_html y tput cnorm
+    if [ "$DO_FULL_PIPELINE" -eq 0 ]; then
+        tput cnorm
+    fi
+else
+    for ip in $TARGETS; do
+        if [ "$MAX_PARALLEL" -gt 1 ]; then
+            scan_host "$ip" &
+            ACTIVE_JOBS=$(( ACTIVE_JOBS + 1 ))
+            while [ "$ACTIVE_JOBS" -ge "$MAX_PARALLEL" ]; do
+                wait -n 2>/dev/null || wait
+                ACTIVE_JOBS=$(( ACTIVE_JOBS - 1 ))
+            done
+        else
+            scan_host "$ip"
+        fi
+    done
+
+    wait
+    tput cnorm
+    generate_html "$GLOBAL_START"
+fi
+
+printf "\n"
+print_box \
+    "  ${B_GREEN}${ICON_CHECK} RECONOCIMIENTO COMPLETO${NC}" \
+    "     ${GRAY}Reportes listos en el directorio actual${NC}"
+printf "\n"
